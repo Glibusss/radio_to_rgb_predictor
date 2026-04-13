@@ -1,3 +1,5 @@
+"""CLI-скрипт для извлечения очищенного эталона радарного дисплея."""
+
 from __future__ import annotations
 
 import argparse
@@ -12,6 +14,8 @@ from radar_synthesis.radar_display import extract_clean_radar_reference, read_rg
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Создает парсер аргументов командной строки для скрипта."""
+
     parser = argparse.ArgumentParser(description="Extract a UI-cleaned radar reference image.")
     parser.add_argument(
         "--input",
@@ -29,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    """Запускает чтение входного кадра и сохранение очищенного эталона."""
+
     args = build_parser().parse_args()
     rgb_image = read_rgb_image(args.input)
     result = extract_clean_radar_reference(rgb_image)

@@ -1,3 +1,5 @@
+"""Физически мотивированный синтез радарного отклика из оптического снимка."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,6 +12,8 @@ import numpy as np
 
 @dataclass(frozen=True)
 class RadarConfig:
+    """Параметры синтеза, описывающие геометрию и радиофизику радара."""
+
     frequency_ghz: float = 9.3
     tx_power_w: float = 50.0
     antenna_height_m: float = 3.0
@@ -24,18 +28,25 @@ class RadarConfig:
 
     @property
     def wavelength_m(self) -> float:
+        """Возвращает длину волны для заданной рабочей частоты."""
+
         return 299_792_458.0 / (self.frequency_ghz * 1e9)
 
 
 @dataclass(frozen=True)
 class SynthesisResult:
+    """Содержит итоговые изображения синтеза и вспомогательные карты."""
+
     radar_image: np.ndarray
     display_radar_image: np.ndarray
+    display_optical_image: np.ndarray
     radar_origin_px: Tuple[float, float]
     debug_maps: Dict[str, np.ndarray]
 
 
 def read_rgb_image(path: str | Path) -> np.ndarray:
+    """Читает изображение с диска и возвращает его в формате RGB."""
+
     image_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise ValueError(f"Cannot read image: {path}")
@@ -43,12 +54,25 @@ def read_rgb_image(path: str | Path) -> np.ndarray:
 
 
 def save_gray_image(path: str | Path, image: np.ndarray) -> None:
+    """Сохраняет одноканальное изображение, создавая родительские каталоги."""
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), image)
 
 
+def save_rgb_image(path: str | Path, image: np.ndarray) -> None:
+    """Сохраняет RGB-изображение на диск в привычном для OpenCV формате."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(path), image_bgr)
+
+
 def save_debug_images(path: str | Path, debug_maps: Dict[str, np.ndarray]) -> None:
+    """Сохраняет набор промежуточных карт отладки в отдельную папку."""
+
     base_path = Path(path)
     base_path.mkdir(parents=True, exist_ok=True)
     for name, image in debug_maps.items():
@@ -56,6 +80,8 @@ def save_debug_images(path: str | Path, debug_maps: Dict[str, np.ndarray]) -> No
 
 
 def normalize01(values: np.ndarray) -> np.ndarray:
+    """Нормализует массив в диапазон от 0 до 1."""
+
     values = values.astype(np.float32)
     minimum = float(values.min())
     maximum = float(values.max())
@@ -65,10 +91,14 @@ def normalize01(values: np.ndarray) -> np.ndarray:
 
 
 def normalize_to_uint8(values: np.ndarray) -> np.ndarray:
+    """Преобразует массив значений в 8-битное изображение после нормализации."""
+
     return (normalize01(values) * 255.0).clip(0, 255).astype(np.uint8)
 
 
 def enhance_radar_contrast(radar_log: np.ndarray) -> np.ndarray:
+    """Усиливает локальный и мелкомасштабный контраст радарного изображения."""
+
     radar_base = normalize_to_uint8(radar_log)
     clahe = cv2.createCLAHE(clipLimit=2.6, tileGridSize=(10, 10))
     local_contrast = clahe.apply(radar_base)
@@ -82,6 +112,8 @@ def enhance_radar_contrast(radar_log: np.ndarray) -> np.ndarray:
 
 
 def local_maxima_mask(values: np.ndarray, threshold: float, ksize: int = 5) -> np.ndarray:
+    """Строит маску локальных максимумов, превышающих заданный порог."""
+
     dilated = cv2.dilate(values, np.ones((ksize, ksize), np.uint8))
     return ((values >= dilated - 1e-8) & (values >= threshold)).astype(np.uint8)
 
@@ -92,6 +124,8 @@ def dominant_axis_angle(
     radius_px: float | None = None,
     min_radius_ratio: float = 0.08,
 ) -> float:
+    """Оценивает доминирующий угол ориентации ярких структур на изображении."""
+
     image_f32 = image.astype(np.float32)
     height, width = image.shape
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
@@ -126,6 +160,8 @@ def dominant_axis_angle(
 
 
 def normalize_axis_angle_delta(target_deg: float, source_deg: float) -> float:
+    """Нормализует разницу осевых углов в диапазон от -90 до 90 градусов."""
+
     delta = target_deg - source_deg
     while delta <= -90.0:
         delta += 180.0
@@ -135,6 +171,8 @@ def normalize_axis_angle_delta(target_deg: float, source_deg: float) -> float:
 
 
 def histogram_match_u8(source: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Подгоняет гистограмму 8-битного изображения под эталонную."""
+
     source_u8 = source.astype(np.uint8)
     reference_u8 = reference.astype(np.uint8)
 
@@ -159,6 +197,8 @@ def warp_to_display_frame(
     display_center_px: Tuple[float, float],
     scale: float,
 ) -> np.ndarray:
+    """Переносит изображение в систему координат экранного радарного дисплея."""
+
     matrix = np.array(
         [
             [scale, 0.0, display_center_px[0] - scale * radar_origin_px[0]],
@@ -177,6 +217,8 @@ def warp_to_display_frame(
 
 
 def build_source_fade_mask(shape: Tuple[int, int], edge_fraction: float = 0.24) -> np.ndarray:
+    """Строит маску плавного затухания к краям исходного кадра."""
+
     height, width = shape
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     edge_x = np.minimum(xx, width - 1.0 - xx)
@@ -186,7 +228,60 @@ def build_source_fade_mask(shape: Tuple[int, int], edge_fraction: float = 0.24) 
     return np.clip(fade, 0.0, 1.0).astype(np.float32)
 
 
+def crop_centered_square(image: np.ndarray, center_px: Tuple[float, float], radius_px: int) -> np.ndarray:
+    """Вырезает квадратный фрагмент вокруг указанного центра."""
+
+    center_x = int(round(center_px[0]))
+    center_y = int(round(center_px[1]))
+    size = 2 * radius_px + 1
+    x0 = center_x - radius_px
+    y0 = center_y - radius_px
+    x1 = x0 + size
+    y1 = y0 + size
+    return image[y0:y1, x0:x1].copy()
+
+
+def make_circular_mask(shape: Tuple[int, int], center_px: Tuple[float, float], radius_px: float) -> np.ndarray:
+    """Создает мягкую круговую маску с плавным спадом на границе."""
+
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]].astype(np.float32)
+    center_x, center_y = center_px
+    dist = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+    fade = np.clip((radius_px - dist) / max(radius_px * 0.05, 1.0), 0.0, 1.0)
+    return fade.astype(np.float32)
+
+
+def resize_square_into_canvas(
+    image: np.ndarray,
+    output_shape: Tuple[int, int],
+    display_center_px: Tuple[float, float],
+    display_radius_px: float,
+    interpolation: int,
+) -> np.ndarray:
+    """Вписывает квадратное изображение в целевой холст по центру дисплея."""
+
+    diameter = max(2, int(round(display_radius_px * 2.0)))
+    resized = cv2.resize(image, (diameter, diameter), interpolation=interpolation)
+
+    if image.ndim == 3:
+        canvas = np.zeros((output_shape[0], output_shape[1], image.shape[2]), dtype=resized.dtype)
+    else:
+        canvas = np.zeros(output_shape, dtype=resized.dtype)
+
+    center_x = int(round(display_center_px[0]))
+    center_y = int(round(display_center_px[1]))
+    half = diameter // 2
+    x0 = center_x - half
+    y0 = center_y - half
+    x1 = x0 + diameter
+    y1 = y0 + diameter
+    canvas[y0:y1, x0:x1] = resized
+    return canvas
+
+
 def rotate_about_center(image: np.ndarray, center_px: Tuple[float, float], angle_deg: float) -> np.ndarray:
+    """Поворачивает изображение вокруг указанного центра."""
+
     if abs(angle_deg) < 1e-3:
         return image
     matrix = cv2.getRotationMatrix2D(center_px, angle_deg, 1.0)
@@ -208,6 +303,8 @@ def render_scatterer_overlay(
     display_center_px: Tuple[float, float],
     scale: float,
 ) -> np.ndarray:
+    """Рисует яркие локальные отражатели и их радиальные хвосты."""
+
     score = normalize01(
         0.55 * sigma_map["sigma_total"] +
         0.35 * priors["edges"] +
@@ -255,6 +352,44 @@ def render_scatterer_overlay(
     return normalize01(overlay)
 
 
+def render_display_optical_image(
+    rgb_image: np.ndarray,
+    radar_origin_px: Tuple[float, float],
+    reference_shape: Tuple[int, int],
+    reference_center_px: Tuple[float, float],
+    reference_radius_px: float,
+) -> np.ndarray:
+    """Формирует круговой оптический фрагмент для сравнения на дисплее."""
+
+    height, width = rgb_image.shape[:2]
+    crop_radius_px = int(
+        max(
+            16,
+            np.floor(
+                min(
+                    radar_origin_px[0],
+                    radar_origin_px[1],
+                    width - 1.0 - radar_origin_px[0],
+                    height - 1.0 - radar_origin_px[1],
+                )
+            ),
+        )
+    )
+    crop = crop_centered_square(rgb_image, radar_origin_px, crop_radius_px)
+    circular_mask = make_circular_mask(crop.shape[:2], (crop_radius_px, crop_radius_px), float(crop_radius_px))
+    crop_f32 = crop.astype(np.float32) * circular_mask[:, :, None]
+    crop_u8 = crop_f32.clip(0, 255).astype(np.uint8)
+    display_optical = resize_square_into_canvas(
+        crop_u8,
+        output_shape=reference_shape,
+        display_center_px=reference_center_px,
+        display_radius_px=reference_radius_px * 0.95,
+        interpolation=cv2.INTER_LINEAR,
+    )
+    final_mask = make_circular_mask(reference_shape, reference_center_px, reference_radius_px * 0.95)
+    return (display_optical.astype(np.float32) * final_mask[:, :, None]).clip(0, 255).astype(np.uint8)
+
+
 def render_display_radar_image(
     priors: Dict[str, np.ndarray],
     sigma_map: Dict[str, np.ndarray],
@@ -262,119 +397,139 @@ def render_display_radar_image(
     radar_origin_px: Tuple[float, float],
     config: RadarConfig,
     reference_clean_image: np.ndarray | None = None,
+    reference_raw_image: np.ndarray | None = None,
+    reference_style_background: np.ndarray | None = None,
+    reference_style_artifacts: np.ndarray | None = None,
     reference_center_px: Tuple[float, float] | None = None,
     reference_radius_px: float | None = None,
 ) -> np.ndarray:
+    """Собирает радарное изображение в экранной геометрии и стиле эталона."""
+
     height, width = ground_radar_image.shape
-    origin_x, origin_y = radar_origin_px
-    corner_distances = [
-        float(np.hypot(origin_x - 0.0, origin_y - 0.0)),
-        float(np.hypot(origin_x - (width - 1.0), origin_y - 0.0)),
-        float(np.hypot(origin_x - 0.0, origin_y - (height - 1.0))),
-        float(np.hypot(origin_x - (width - 1.0), origin_y - (height - 1.0))),
-    ]
-    max_dist = max(max(corner_distances), 1.0)
+    crop_radius_px = int(
+        max(
+            16,
+            np.floor(
+                min(
+                    radar_origin_px[0],
+                    radar_origin_px[1],
+                    width - 1.0 - radar_origin_px[0],
+                    height - 1.0 - radar_origin_px[1],
+                )
+            ),
+        )
+    )
+
+    local_center = (float(crop_radius_px), float(crop_radius_px))
+    local_priors = {
+        name: crop_centered_square(values, radar_origin_px, crop_radius_px)
+        for name, values in priors.items()
+    }
+    local_sigma_map = {
+        name: crop_centered_square(values, radar_origin_px, crop_radius_px)
+        for name, values in sigma_map.items()
+    }
+    ground_crop = crop_centered_square(ground_radar_image, radar_origin_px, crop_radius_px)
+    sigma_crop = normalize_to_uint8(local_sigma_map["sigma_total"])
+    scatter_crop = render_scatterer_overlay(
+        priors=local_priors,
+        sigma_map=local_sigma_map,
+        radar_origin_px=local_center,
+        output_shape=ground_crop.shape,
+        display_center_px=local_center,
+        scale=1.0,
+    )
+
+    crop_mask = make_circular_mask(ground_crop.shape, local_center, float(crop_radius_px))
+    base_crop = normalize01(0.22 * ground_crop.astype(np.float32) + 0.78 * sigma_crop.astype(np.float32))
+    base_crop = cv2.GaussianBlur(base_crop, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    display_crop = normalize01((0.38 * base_crop + 0.62 * scatter_crop) * crop_mask)
 
     if reference_clean_image is not None and reference_center_px is not None and reference_radius_px is not None:
         output_shape = reference_clean_image.shape
         display_center_px = reference_center_px
         display_radius_px = reference_radius_px * 0.95
     else:
-        side = int(np.ceil(max_dist * 2.1))
-        side = max(side, max(height, width))
-        output_shape = (side, side)
-        display_center_px = (side / 2.0, side / 2.0)
-        display_radius_px = side * 0.46
+        output_shape = ground_crop.shape
+        display_center_px = local_center
+        display_radius_px = float(crop_radius_px)
 
-    scale = float(display_radius_px / max_dist)
-
-    warped_ground = warp_to_display_frame(
-        ground_radar_image,
-        radar_origin_px=radar_origin_px,
+    display_canvas = resize_square_into_canvas(
+        normalize_to_uint8(display_crop),
         output_shape=output_shape,
         display_center_px=display_center_px,
-        scale=scale,
-    )
-    warped_sigma = warp_to_display_frame(
-        normalize_to_uint8(sigma_map["sigma_total"]),
-        radar_origin_px=radar_origin_px,
-        output_shape=output_shape,
-        display_center_px=display_center_px,
-        scale=scale,
-    )
-    source_support = warp_to_display_frame(
-        build_source_fade_mask(ground_radar_image.shape),
-        radar_origin_px=radar_origin_px,
-        output_shape=output_shape,
-        display_center_px=display_center_px,
-        scale=scale,
-    )
-    scatter_overlay = render_scatterer_overlay(
-        priors=priors,
-        sigma_map=sigma_map,
-        radar_origin_px=radar_origin_px,
-        output_shape=output_shape,
-        display_center_px=display_center_px,
-        scale=scale,
-    )
-
-    base = normalize01(0.18 * warped_ground.astype(np.float32) + 0.82 * warped_sigma.astype(np.float32))
-    base = cv2.GaussianBlur(base, (0, 0), sigmaX=1.0, sigmaY=1.0)
-    display_image = 0.42 * base + 0.58 * scatter_overlay
+        display_radius_px=display_radius_px,
+        interpolation=cv2.INTER_LINEAR,
+    ).astype(np.float32)
 
     rng = np.random.default_rng(config.seed)
-    coarse_noise = cv2.GaussianBlur(rng.random(output_shape, dtype=np.float32), (0, 0), sigmaX=3.2, sigmaY=3.2)
+    coarse_noise = cv2.GaussianBlur(rng.random(output_shape, dtype=np.float32), (0, 0), sigmaX=3.0, sigmaY=3.0)
     fine_noise = cv2.GaussianBlur(rng.random(output_shape, dtype=np.float32), (0, 0), sigmaX=0.9, sigmaY=0.9)
-    background = normalize01(0.65 * coarse_noise + 0.35 * fine_noise)
+    background = normalize01(0.60 * coarse_noise + 0.40 * fine_noise)
     if reference_clean_image is not None:
         ref_threshold = float(np.quantile(reference_clean_image, 0.88))
         reference_background = np.minimum(reference_clean_image.astype(np.float32), ref_threshold)
-        reference_background = normalize01(cv2.GaussianBlur(reference_background, (0, 0), sigmaX=2.2, sigmaY=2.2))
-        background = normalize01(0.40 * background + 0.60 * reference_background)
+        reference_background = normalize01(cv2.GaussianBlur(reference_background, (0, 0), sigmaX=2.0, sigmaY=2.0))
+        background = normalize01(0.45 * background + 0.55 * reference_background)
 
     if reference_clean_image is not None and reference_center_px is not None and reference_radius_px is not None:
-        source_angle = dominant_axis_angle(normalize_to_uint8(display_image), display_center_px, display_radius_px)
+        source_angle = dominant_axis_angle(display_canvas.astype(np.uint8), display_center_px, display_radius_px)
         target_angle = dominant_axis_angle(reference_clean_image, reference_center_px, reference_radius_px)
         rotation_delta = normalize_axis_angle_delta(target_angle, source_angle)
-        display_image = rotate_about_center(display_image, display_center_px, rotation_delta)
-        source_support = rotate_about_center(source_support, display_center_px, rotation_delta)
-        display_image = normalize01(display_image)
+        display_canvas = rotate_about_center(display_canvas, display_center_px, rotation_delta)
 
-    support_soft = cv2.GaussianBlur(np.clip(source_support, 0.0, 1.0), (0, 0), sigmaX=10.0, sigmaY=10.0)
-    support_soft = np.power(np.clip(support_soft, 0.0, 1.0), 1.6)
-    display_image = (
-        0.72 * display_image * support_soft +
-        0.28 * background * (1.0 - 0.30 * support_soft)
-    )
-    display_image = normalize01(display_image)
-    display_u8 = normalize_to_uint8(display_image)
+    circle_mask = make_circular_mask(output_shape, display_center_px, display_radius_px)
+    display_canvas = normalize01(display_canvas)
     if reference_clean_image is not None:
+        reference_target = normalize01(reference_clean_image.astype(np.float32))
+        reference_envelope = normalize01(
+            cv2.GaussianBlur(reference_clean_image.astype(np.float32), (0, 0), sigmaX=5.0, sigmaY=5.0)
+        )
+        display_canvas = normalize01(0.62 * display_canvas + 0.20 * reference_envelope + 0.18 * reference_target)
+        display_canvas = normalize01(display_canvas * (0.84 + 0.32 * reference_envelope))
+
+    if reference_style_background is not None:
+        style_background = normalize01(reference_style_background.astype(np.float32))
+        background = normalize01(0.30 * background + 0.70 * style_background)
+        display_canvas = normalize01(display_canvas * (0.82 + 0.24 * style_background) + 0.10 * style_background)
+
+    if reference_style_artifacts is not None:
+        style_artifacts = normalize01(reference_style_artifacts.astype(np.float32))
+        style_artifacts = cv2.GaussianBlur(style_artifacts, (0, 0), sigmaX=0.7, sigmaY=0.7)
+        display_canvas = normalize01(display_canvas + 0.22 * style_artifacts * np.power(circle_mask, 0.85))
+
+    display_canvas = normalize01(0.74 * display_canvas + 0.26 * background)
+    display_canvas = np.power(display_canvas, 1.08)
+    display_canvas = normalize01(display_canvas * circle_mask)
+
+    display_u8 = normalize_to_uint8(display_canvas)
+    if reference_raw_image is not None:
+        display_u8 = histogram_match_u8(display_u8, reference_raw_image)
+    elif reference_clean_image is not None:
         display_u8 = histogram_match_u8(display_u8, reference_clean_image)
-
-    yy, xx = np.mgrid[0:output_shape[0], 0:output_shape[1]].astype(np.float32)
-    center_x, center_y = display_center_px
-    dist = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
-    radial_mask = (dist <= display_radius_px).astype(np.float32)
-
-    fade = np.clip((display_radius_px - dist) / max(display_radius_px * 0.08, 1.0), 0.0, 1.0)
-    display_f32 = display_u8.astype(np.float32) * radial_mask * fade
-    display_f32 = cv2.GaussianBlur(display_f32, (0, 0), sigmaX=0.6, sigmaY=0.6)
-    return normalize_to_uint8(display_f32)
+    display_u8 = (display_u8.astype(np.float32) * circle_mask).clip(0, 255).astype(np.uint8)
+    return display_u8
 
 
 def gradient_magnitude(gray_u8: np.ndarray) -> np.ndarray:
+    """Вычисляет модуль градиента для одноканального изображения."""
+
     grad_x = cv2.Sobel(gray_u8, cv2.CV_32F, 1, 0, ksize=3)
     grad_y = cv2.Sobel(gray_u8, cv2.CV_32F, 0, 1, ksize=3)
     return np.sqrt(grad_x * grad_x + grad_y * grad_y)
 
 
 def corner_response(gray_u8: np.ndarray) -> np.ndarray:
+    """Оценивает выраженность угловых структур по Harris-отклику."""
+
     corners = cv2.cornerHarris(gray_u8.astype(np.float32), blockSize=2, ksize=3, k=0.04)
     corners = cv2.GaussianBlur(corners, (5, 5), 0.0)
     return np.maximum(corners, 0.0)
 
 
 def local_variance_map(gray_f32: np.ndarray, sigma: float = 3.0) -> np.ndarray:
+    """Строит карту локальной дисперсии как меру текстурности сцены."""
+
     mean = cv2.GaussianBlur(gray_f32, (0, 0), sigmaX=sigma, sigmaY=sigma)
     mean_sq = cv2.GaussianBlur(gray_f32 * gray_f32, (0, 0), sigmaX=sigma, sigmaY=sigma)
     variance = np.maximum(mean_sq - mean * mean, 0.0)
@@ -382,6 +537,8 @@ def local_variance_map(gray_f32: np.ndarray, sigma: float = 3.0) -> np.ndarray:
 
 
 def estimate_surface_priors(rgb_image: np.ndarray) -> Dict[str, np.ndarray]:
+    """Оценивает априорные карты типов поверхности по оптическому снимку."""
+
     rgb_f32 = rgb_image.astype(np.float32) / 255.0
     red, green, blue = cv2.split(rgb_f32)
 
@@ -428,6 +585,8 @@ def estimate_surface_priors(rgb_image: np.ndarray) -> Dict[str, np.ndarray]:
 
 
 def estimate_radar_origin(priors: Dict[str, np.ndarray]) -> Tuple[float, float]:
+    """Оценивает положение условного центра радара по структуре сцены."""
+
     built = priors["built"]
     road = priors["road"]
     height, width = built.shape
@@ -448,6 +607,8 @@ def build_geometry(
     radar_origin_px: Tuple[float, float],
     config: RadarConfig,
 ) -> Dict[str, np.ndarray]:
+    """Вычисляет геометрию обзора и дальностные характеристики радара."""
+
     height, width = shape
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     origin_x, origin_y = radar_origin_px
@@ -481,6 +642,8 @@ def build_geometry(
 
 
 def build_forest_attenuation(priors: Dict[str, np.ndarray], config: RadarConfig) -> np.ndarray:
+    """Оценивает затухание сигнала внутри плотной растительности."""
+
     vegetation = priors["vegetation"]
     vegetation_mask = (vegetation > max(0.42, float(np.quantile(vegetation, 0.72)))).astype(np.uint8)
     if vegetation_mask.max() == 0:
@@ -497,6 +660,8 @@ def build_sigma_map(
     geometry: Dict[str, np.ndarray],
     config: RadarConfig,
 ) -> Dict[str, np.ndarray]:
+    """Строит карту эффективной площади рассеяния по типам поверхности."""
+
     gray = priors["gray"]
     built = priors["built"]
     road = priors["road"]
@@ -547,6 +712,8 @@ def apply_radar_response(
     config: RadarConfig,
     rng: np.random.Generator,
 ) -> np.ndarray:
+    """Преобразует карту рассеяния в итоговый радарный отклик с шумом."""
+
     sigma_total = sigma_map["sigma_total"]
     slant_range_m = np.maximum(geometry["slant_range_m"], 1.0)
     wavelength_sq = config.wavelength_m ** 2
@@ -583,9 +750,14 @@ def synthesize_radar_image(
     rgb_image: np.ndarray,
     config: RadarConfig | None = None,
     reference_clean_image: np.ndarray | None = None,
+    reference_raw_image: np.ndarray | None = None,
+    reference_style_background: np.ndarray | None = None,
+    reference_style_artifacts: np.ndarray | None = None,
     reference_center_px: Tuple[float, float] | None = None,
     reference_radius_px: float | None = None,
 ) -> SynthesisResult:
+    """Запускает полный конвейер синтеза наземного и экранного радарного изображения."""
+
     if config is None:
         config = RadarConfig()
 
@@ -595,6 +767,24 @@ def synthesize_radar_image(
     sigma_map = build_sigma_map(priors, geometry, config)
     rng = np.random.default_rng(config.seed)
     radar_image = apply_radar_response(sigma_map, geometry, config, rng)
+    if reference_clean_image is not None and reference_center_px is not None and reference_radius_px is not None:
+        display_optical_image = render_display_optical_image(
+            rgb_image=rgb_image,
+            radar_origin_px=radar_origin_px,
+            reference_shape=reference_clean_image.shape,
+            reference_center_px=reference_center_px,
+            reference_radius_px=reference_radius_px,
+        )
+    else:
+        side = min(rgb_image.shape[0], rgb_image.shape[1])
+        center = (side / 2.0, side / 2.0)
+        display_optical_image = render_display_optical_image(
+            rgb_image=rgb_image,
+            radar_origin_px=radar_origin_px,
+            reference_shape=(side, side),
+            reference_center_px=center,
+            reference_radius_px=side * 0.48,
+        )
     display_radar_image = render_display_radar_image(
         priors=priors,
         sigma_map=sigma_map,
@@ -602,6 +792,9 @@ def synthesize_radar_image(
         radar_origin_px=radar_origin_px,
         config=config,
         reference_clean_image=reference_clean_image,
+        reference_raw_image=reference_raw_image,
+        reference_style_background=reference_style_background,
+        reference_style_artifacts=reference_style_artifacts,
         reference_center_px=reference_center_px,
         reference_radius_px=reference_radius_px,
     )
@@ -632,6 +825,7 @@ def synthesize_radar_image(
     return SynthesisResult(
         radar_image=radar_image,
         display_radar_image=display_radar_image,
+        display_optical_image=display_optical_image,
         radar_origin_px=radar_origin_px,
         debug_maps=debug_maps,
     )

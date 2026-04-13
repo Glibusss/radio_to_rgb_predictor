@@ -1,3 +1,5 @@
+"""Извлечение и очистка эталонного изображения радарного дисплея."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,12 +12,19 @@ import numpy as np
 
 @dataclass(frozen=True)
 class RadarDisplayResult:
+    """Результат выделения полезного сигнала и стиля радарного экрана."""
+
     clean_image: np.ndarray
+    raw_response: np.ndarray
+    style_background: np.ndarray
+    style_artifacts: np.ndarray
     center_px: Tuple[float, float]
     radius_px: float
 
 
 def read_rgb_image(path: str | Path) -> np.ndarray:
+    """Читает изображение с диска и возвращает его в RGB-представлении."""
+
     image_bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image_bgr is None:
         raise ValueError(f"Cannot read image: {path}")
@@ -23,12 +32,16 @@ def read_rgb_image(path: str | Path) -> np.ndarray:
 
 
 def save_gray_image(path: str | Path, image: np.ndarray) -> None:
+    """Сохраняет одноканальное изображение, создавая каталог при необходимости."""
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), image)
 
 
 def normalize01(values: np.ndarray) -> np.ndarray:
+    """Нормализует массив в диапазон от 0 до 1."""
+
     values = values.astype(np.float32)
     minimum = float(values.min())
     maximum = float(values.max())
@@ -38,16 +51,22 @@ def normalize01(values: np.ndarray) -> np.ndarray:
 
 
 def normalize_to_uint8(values: np.ndarray) -> np.ndarray:
+    """Переводит значения в 8-битный формат после нормализации."""
+
     return (normalize01(values) * 255.0).clip(0, 255).astype(np.uint8)
 
 
 def extract_green_response(rgb_image: np.ndarray) -> np.ndarray:
+    """Выделяет зеленый отклик, характерный для свечения радарного дисплея."""
+
     rgb_f32 = rgb_image.astype(np.float32)
     response = rgb_f32[:, :, 1] - 0.50 * rgb_f32[:, :, 0] - 0.50 * rgb_f32[:, :, 2]
     return normalize01(np.maximum(response, 0.0))
 
 
 def estimate_display_circle(response: np.ndarray) -> Tuple[Tuple[float, float], float]:
+    """Оценивает центр и радиус кругового экрана по маске яркого отклика."""
+
     threshold = max(0.08, float(np.quantile(response, 0.75)))
     mask = (response > threshold).astype(np.uint8) * 255
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -61,6 +80,8 @@ def estimate_display_circle(response: np.ndarray) -> Tuple[Tuple[float, float], 
 
 
 def suppress_radial_rings(response: np.ndarray, center_px: Tuple[float, float], radius_px: float) -> np.ndarray:
+    """Подавляет паразитные радиальные кольца в пределах экрана."""
+
     height, width = response.shape
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     center_x, center_y = center_px
@@ -85,8 +106,28 @@ def suppress_radial_rings(response: np.ndarray, center_px: Tuple[float, float], 
 
 
 def extract_clean_radar_reference(rgb_image: np.ndarray) -> RadarDisplayResult:
+    """Извлекает очищенный эталон радара и карты стилевых артефактов."""
+
     response = extract_green_response(rgb_image)
     center_px, radius_px = estimate_display_circle(response)
     cleaned = suppress_radial_rings(response, center_px, radius_px)
-    cleaned = cv2.medianBlur(normalize_to_uint8(cleaned), 3)
-    return RadarDisplayResult(clean_image=cleaned, center_px=center_px, radius_px=radius_px)
+    raw_u8 = normalize_to_uint8(response)
+    cleaned_u8 = cv2.medianBlur(normalize_to_uint8(cleaned), 3)
+
+    raw_f32 = raw_u8.astype(np.float32) / 255.0
+    background_floor = float(np.quantile(raw_f32, 0.86))
+    style_background = np.minimum(raw_f32, background_floor)
+    style_background = cv2.GaussianBlur(style_background, (0, 0), sigmaX=2.0, sigmaY=2.0)
+
+    smooth = cv2.GaussianBlur(raw_f32, (0, 0), sigmaX=3.4, sigmaY=3.4)
+    style_artifacts = np.maximum(raw_f32 - smooth, 0.0)
+    style_artifacts = cv2.GaussianBlur(style_artifacts, (0, 0), sigmaX=1.0, sigmaY=1.0)
+
+    return RadarDisplayResult(
+        clean_image=cleaned_u8,
+        raw_response=raw_u8,
+        style_background=normalize_to_uint8(style_background),
+        style_artifacts=normalize_to_uint8(style_artifacts),
+        center_px=center_px,
+        radius_px=radius_px,
+    )

@@ -1,3 +1,5 @@
+"""Утилиты для нарезки парных и непарных обучающих патчей."""
+
 from __future__ import annotations
 
 import json
@@ -12,24 +14,32 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Window:
+    """Описывает квадратное окно в координатах исходного изображения."""
+
     x: int
     y: int
     size: int
 
 
 def ensure_dir(path: str | Path) -> Path:
+    """Создает каталог, если его еще нет, и возвращает путь к нему."""
+
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 def sliding_windows(height: int, width: int, patch_size: int, stride: int) -> List[Window]:
+    """Строит сетку квадратных окон с гарантированным покрытием границ."""
+
     if patch_size <= 0 or stride <= 0:
         raise ValueError("patch_size and stride must be positive")
     if patch_size > height or patch_size > width:
         return []
 
     def axis_positions(length: int) -> List[int]:
+        """Возвращает позиции начала окна вдоль одной оси."""
+
         positions = list(range(0, max(length - patch_size + 1, 1), stride))
         last = length - patch_size
         if not positions or positions[-1] != last:
@@ -42,6 +52,8 @@ def sliding_windows(height: int, width: int, patch_size: int, stride: int) -> Li
 
 
 def patch_content_score(image: np.ndarray) -> float:
+    """Оценивает информативность патча по контрасту и средней яркости."""
+
     if image.ndim == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     else:
@@ -51,10 +63,14 @@ def patch_content_score(image: np.ndarray) -> float:
 
 
 def extract_patch(image: np.ndarray, window: Window) -> np.ndarray:
+    """Возвращает копию патча, вырезанного по заданному окну."""
+
     return image[window.y : window.y + window.size, window.x : window.x + window.size].copy()
 
 
 def split_train_val(items: Sequence[Window], val_ratio: float, seed: int) -> Tuple[List[Window], List[Window]]:
+    """Перемешивает окна и делит их на обучающую и валидационную выборки."""
+
     items_list = list(items)
     random.Random(seed).shuffle(items_list)
     if not items_list:
@@ -67,6 +83,8 @@ def split_train_val(items: Sequence[Window], val_ratio: float, seed: int) -> Tup
 
 
 def save_patch(path: str | Path, image: np.ndarray) -> None:
+    """Сохраняет патч на диск с учетом цветности изображения."""
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if image.ndim == 3:
@@ -77,6 +95,8 @@ def save_patch(path: str | Path, image: np.ndarray) -> None:
 
 
 def apply_augmentation(image: np.ndarray, mode: str) -> np.ndarray:
+    """Применяет одно из поддерживаемых геометрических преобразований."""
+
     if mode == "orig":
         return image.copy()
     if mode == "rot90":
@@ -99,6 +119,8 @@ def export_paired_chunks(
     seed: int = 42,
     train_augmentations: Sequence[str] = ("orig", "rot90", "rot180", "flip_lr"),
 ) -> Dict[str, int]:
+    """Экспортирует пары оптических и радарных патчей для обучения."""
+
     if optical_image.shape[:2] != radar_image.shape[:2]:
         raise ValueError("optical_image and radar_image must have identical spatial size")
 
@@ -159,6 +181,8 @@ def export_unpaired_radar_bank(
     stride: int = 128,
     min_content_score: float = 18.0,
 ) -> Dict[str, int]:
+    """Сохраняет банк информативных радарных патчей без парной оптики."""
+
     output_dir = ensure_dir(output_dir)
     windows = sliding_windows(radar_image.shape[0], radar_image.shape[1], patch_size, stride)
 
