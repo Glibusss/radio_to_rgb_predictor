@@ -1,0 +1,9 @@
+{
+  "frequency_ghz": 9.4,
+  "transmit_power_w": 50.0,
+  "antenna_gain_db": 30.0,
+  "system_loss_db": 6.0,
+  "antenna_height_m": 3.0,
+  "reference_range_m": 200.0,
+  "meters_per_pixel": 0.375
+}

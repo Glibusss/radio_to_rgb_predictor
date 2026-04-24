@@ -13,6 +13,7 @@ DEFAULT_PIPELINE_SWITCHES: Dict[str, bool] = {
     "use_probability_smoothing": True,
     "use_component_cleanup": True,
     "use_rcs_mapping": True,
+    "use_radar_equation": True,
     "use_brightness_normalization": False,
     "use_shadow_rcs_nearest_majority": True,
     "use_vehicle_rcs_distribution": False,
