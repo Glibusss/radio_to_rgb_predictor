@@ -8,6 +8,7 @@
   "use_rcs_mapping": true,
   "use_radar_equation": true,
   "use_radar_boundaries": true,
+  "use_radar_glints": true,
   "use_brightness_normalization": false,
   "use_shadow_rcs_nearest_majority": true,
   "use_vehicle_rcs_distribution": false

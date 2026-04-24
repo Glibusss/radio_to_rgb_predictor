@@ -19,6 +19,8 @@ class RadarEquationResult:
     received_power_dbw: np.ndarray
     heatmap: np.ndarray
     overlay: np.ndarray
+    glint_map: np.ndarray
+    glint_overlay: np.ndarray
     boundary_map: np.ndarray
     boundary_overlay: np.ndarray
     debug_maps: Mapping[str, np.ndarray]
@@ -176,6 +178,42 @@ def _apply_white_gaussian_noise(
     return noisy_values_dbw, noise, report
 
 
+def _render_positive_grayscale(values_linear: np.ndarray) -> np.ndarray:
+    positive = np.isfinite(values_linear) & (values_linear > 0.0)
+    if not np.any(positive):
+        return np.zeros(values_linear.shape + (3,), dtype=np.uint8)
+    positive_values = values_linear[positive].astype(np.float32)
+    reference_value = float(np.percentile(positive_values, 70.0))
+    max_value = float(np.percentile(positive_values, 99.8))
+    if reference_value <= 0.0:
+        reference_value = float(np.percentile(positive_values, 25.0))
+    if max_value <= 0.0:
+        max_value = float(positive_values.max())
+    scaled = np.zeros_like(values_linear, dtype=np.float32)
+    denominator = np.log1p(max(max_value, reference_value) / max(reference_value, 1e-12))
+    scaled[positive] = np.log1p(values_linear[positive] / max(reference_value, 1e-12)) / max(denominator, 1e-12)
+    scaled = scaled.clip(0.0, 1.0)
+    gray = (np.power(scaled, 0.78) * 255.0).astype(np.uint8)
+    return np.repeat(gray[:, :, None], 3, axis=2)
+
+
+def _glint_gain_db(class_name: str, is_boundary: bool) -> float:
+    class_gain_db = {
+        "forest": 6.0,
+        "building": 6.0,
+        "asphalt_road": 8.5,
+        "dirt_road": 7.5,
+        "water": 4.5,
+        "forest_shadow": 4.0,
+        "building_shadow": 4.5,
+        "shrub": 8.0,
+        "vehicle": 8.5,
+    }.get(class_name, 5.0)
+    if is_boundary:
+        class_gain_db += 3.0
+    return float(class_gain_db)
+
+
 def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float) -> np.ndarray:
     finite = np.isfinite(values_dbw)
     if not np.any(finite):
@@ -191,7 +229,7 @@ def _keep_central_boundary_cluster(
     boundary_mask: np.ndarray,
     origin_px: tuple[float, float],
     center_radius_px: float,
-) -> tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, object]]:
     binary_mask = boundary_mask.astype(np.uint8)
     component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
     if component_count <= 1:
@@ -202,7 +240,12 @@ def _keep_central_boundary_cluster(
             "selected_component": None,
             "kept_pixel_count": 0,
         }
-        return boundary_mask.astype(bool), np.zeros_like(boundary_mask, dtype=bool), cluster_report
+        return (
+            boundary_mask.astype(bool),
+            np.zeros_like(boundary_mask, dtype=bool),
+            boundary_mask.astype(bool),
+            cluster_report,
+        )
 
     components = []
     for label in range(1, component_count):
@@ -229,7 +272,12 @@ def _keep_central_boundary_cluster(
             "selected_component": None,
             "kept_pixel_count": 0,
         }
-        return np.zeros_like(boundary_mask, dtype=bool), np.zeros_like(boundary_mask, dtype=bool), cluster_report
+        return (
+            np.zeros_like(boundary_mask, dtype=bool),
+            np.zeros_like(boundary_mask, dtype=bool),
+            np.zeros_like(boundary_mask, dtype=bool),
+            cluster_report,
+        )
 
     central_candidates = [
         component for component in components if component["centroid_distance_px"] <= float(center_radius_px)
@@ -322,7 +370,31 @@ def _keep_central_boundary_cluster(
         "kept_pixel_count": int(kept_mask.sum()),
         "top_components": top_components,
     }
-    return kept_mask.astype(bool), support_region.astype(bool), cluster_report
+    return kept_mask.astype(bool), support_region.astype(bool), primary_mask.astype(bool), cluster_report
+
+
+def _estimate_primary_cluster_region(primary_boundary_mask: np.ndarray, fallback_region: np.ndarray) -> np.ndarray:
+    if not np.any(primary_boundary_mask):
+        return fallback_region.astype(bool)
+
+    closed_boundary = cv2.morphologyEx(
+        primary_boundary_mask.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        _kernel(9),
+        iterations=2,
+    )
+    contours, _ = cv2.findContours(closed_boundary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return fallback_region.astype(bool)
+
+    filled_region = np.zeros_like(closed_boundary, dtype=np.uint8)
+    largest_contour = max(contours, key=cv2.contourArea)
+    cv2.drawContours(filled_region, [largest_contour], -1, 1, thickness=cv2.FILLED)
+    filled_region = cv2.morphologyEx(filled_region, cv2.MORPH_CLOSE, _kernel(9), iterations=1)
+    resolved_region = filled_region > 0
+    if int(np.count_nonzero(resolved_region)) < int(np.count_nonzero(primary_boundary_mask)):
+        return fallback_region.astype(bool)
+    return resolved_region
 
 
 def _build_radar_boundaries(
@@ -333,7 +405,7 @@ def _build_radar_boundaries(
     boundary_classes: Sequence[str],
     thickness_px: int,
     center_radius_px: float,
-) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[str, int]], Dict[str, object], np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[str, int]], Dict[str, object], np.ndarray, np.ndarray]:
     height, width = class_map.shape
     class_index = {name: idx for idx, name in enumerate(class_names)}
     all_boundaries = np.zeros((height, width), dtype=bool)
@@ -359,7 +431,7 @@ def _build_radar_boundaries(
         per_class_maps[class_name] = full_boundary.astype(np.float32)
         report[class_name] = {"pixel_count": int(full_boundary.sum())}
 
-    filtered_boundaries, support_region, cluster_report = _keep_central_boundary_cluster(
+    filtered_boundaries, support_region, primary_boundary_mask, cluster_report = _keep_central_boundary_cluster(
         boundary_mask=all_boundaries,
         origin_px=origin_px,
         center_radius_px=center_radius_px,
@@ -375,7 +447,308 @@ def _build_radar_boundaries(
     overlay = rgb_image.astype(np.float32).copy()
     overlay[all_boundaries] = 0.25 * overlay[all_boundaries] + 0.75 * 255.0
     boundary_overlay = overlay.clip(0, 255).astype(np.uint8)
-    return boundary_map, boundary_overlay, per_class_maps, report, cluster_report, support_region.astype(bool)
+    return (
+        boundary_map,
+        boundary_overlay,
+        per_class_maps,
+        report,
+        cluster_report,
+        support_region.astype(bool),
+        primary_boundary_mask.astype(bool),
+    )
+
+
+def _build_radar_glints(
+    rgb_image: np.ndarray,
+    candidate_mask: np.ndarray,
+    boundary_mask: np.ndarray,
+    primary_region: np.ndarray,
+    class_map: np.ndarray,
+    class_names: Sequence[str],
+    geometry: Mapping[str, np.ndarray],
+    base_received_power_w: np.ndarray,
+    meters_per_pixel: float,
+    angular_resolution_deg: float,
+    range_resolution_m: float,
+    spill_resolution_elements: float,
+    peak_gain_db: float,
+    noise_seed: int | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, object], Dict[str, np.ndarray]]:
+    height, width = candidate_mask.shape
+    zero_rgb = np.zeros((height, width, 3), dtype=np.uint8)
+    zero_float = np.zeros((height, width), dtype=np.float32)
+    default_report: Dict[str, object] = {
+        "applied": False,
+        "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
+        "selected_glint_count": 0,
+        "selected_glint_count_by_class": {},
+        "angular_resolution_deg": float(angular_resolution_deg),
+        "range_resolution_m": float(range_resolution_m),
+        "range_resolution_px": 0.0,
+        "median_cross_range_resolution_px": 0.0,
+        "spill_resolution_elements": float(spill_resolution_elements),
+        "max_spill_px": 0.0,
+        "peak_gain_db": float(peak_gain_db),
+        "background_noise_scale_w": 0.0,
+    }
+    default_debug = {
+        "seed_mask": zero_float,
+        "candidate_mask": candidate_mask.astype(np.float32),
+        "primary_region": primary_region.astype(np.float32),
+        "outside_attenuation": np.ones((height, width), dtype=np.float32),
+        "background_noise_w": zero_float,
+        "speckle_gain": np.ones((height, width), dtype=np.float32),
+        "glint_power_w": zero_float,
+    }
+    if (
+        angular_resolution_deg <= 0.0
+        or range_resolution_m <= 0.0
+        or meters_per_pixel <= 0.0
+        or not np.any(candidate_mask)
+        or not np.any(primary_region)
+    ):
+        return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
+
+    ys, xs = np.nonzero(candidate_mask)
+    range_m = geometry["line_of_sight_ground_m"][ys, xs]
+    dx_m = geometry["dx_m"][ys, xs]
+    dy_m = geometry["dy_m"][ys, xs]
+    angle_deg = (np.degrees(np.arctan2(dy_m, dx_m)) + 360.0) % 360.0
+    angle_bins = np.floor(angle_deg / angular_resolution_deg).astype(np.int32)
+    range_bins = np.floor(range_m / range_resolution_m).astype(np.int32)
+
+    class_pixels_per_seed = {
+        "forest": 320,
+        "building": 110,
+        "asphalt_road": 55,
+        "dirt_road": 75,
+        "water": 150,
+        "forest_shadow": 180,
+        "building_shadow": 140,
+        "shrub": 70,
+        "vehicle": 20,
+    }
+    class_max_per_cell = {
+        "forest": 1,
+        "building": 2,
+        "asphalt_road": 5,
+        "dirt_road": 4,
+        "water": 2,
+        "forest_shadow": 2,
+        "building_shadow": 2,
+        "shrub": 4,
+        "vehicle": 2,
+    }
+    boundary_pixels_per_seed = 60
+    boundary_max_per_cell = 3
+    class_name_by_candidate = [str(class_names[int(class_map[int(y), int(x)])]) for y, x in zip(ys, xs)]
+    boundary_flag_by_candidate = boundary_mask[ys, xs].astype(bool)
+
+    class_groups: Dict[tuple[int, int, str], list[int]] = {}
+    boundary_groups: Dict[tuple[int, int], list[int]] = {}
+    for idx in range(len(xs)):
+        angle_bin = int(angle_bins[idx])
+        range_bin = int(range_bins[idx])
+        class_name = class_name_by_candidate[idx]
+        class_groups.setdefault((angle_bin, range_bin, class_name), []).append(idx)
+        if boundary_flag_by_candidate[idx]:
+            boundary_groups.setdefault((angle_bin, range_bin), []).append(idx)
+
+    selected_seeds: list[Dict[str, float | str | bool]] = []
+    selected_seed_registry: Dict[tuple[int, int, str], Dict[str, float | str | bool]] = {}
+
+    def _register_seed(candidate_idx: int, force_boundary: bool) -> None:
+        y = int(ys[candidate_idx])
+        x = int(xs[candidate_idx])
+        class_name = class_name_by_candidate[candidate_idx]
+        registry_key = (y, x, class_name)
+        existing = selected_seed_registry.get(registry_key)
+        if existing is not None:
+            if force_boundary:
+                existing["is_boundary"] = True
+            return
+        payload: Dict[str, float | str | bool] = {
+            "y": float(y),
+            "x": float(x),
+            "power_w": float(base_received_power_w[y, x]),
+            "range_m": float(range_m[candidate_idx]),
+            "dx_m": float(dx_m[candidate_idx]),
+            "dy_m": float(dy_m[candidate_idx]),
+            "class_name": class_name,
+            "is_boundary": bool(force_boundary),
+        }
+        selected_seed_registry[registry_key] = payload
+        selected_seeds.append(payload)
+
+    for (angle_bin, range_bin, class_name), group_indices in class_groups.items():
+        power_sorted = sorted(group_indices, key=lambda idx: float(base_received_power_w[int(ys[idx]), int(xs[idx])]), reverse=True)
+        pixels_per_seed = int(class_pixels_per_seed.get(class_name, 140))
+        max_per_cell = int(class_max_per_cell.get(class_name, 2))
+        selected_count = min(max_per_cell, max(1, int(np.ceil(len(group_indices) / max(pixels_per_seed, 1)))))
+        for candidate_idx in power_sorted[:selected_count]:
+            _register_seed(candidate_idx=candidate_idx, force_boundary=False)
+
+    for (_angle_bin, _range_bin), group_indices in boundary_groups.items():
+        power_sorted = sorted(group_indices, key=lambda idx: float(base_received_power_w[int(ys[idx]), int(xs[idx])]), reverse=True)
+        selected_count = min(boundary_max_per_cell, max(1, int(np.ceil(len(group_indices) / max(boundary_pixels_per_seed, 1)))))
+        for candidate_idx in power_sorted[:selected_count]:
+            _register_seed(candidate_idx=candidate_idx, force_boundary=True)
+
+    if not selected_seeds:
+        return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
+
+    glint_power_w = np.zeros((height, width), dtype=np.float32)
+    seed_mask = np.zeros((height, width), dtype=np.float32)
+    range_resolution_px = max(1.0, float(range_resolution_m / meters_per_pixel))
+    cross_resolution_values_px = []
+    candidate_values = base_received_power_w[candidate_mask.astype(bool)]
+    global_seed_floor_w = (
+        float(np.percentile(candidate_values, 70.0))
+        if candidate_values.size > 0
+        else _MIN_LINEAR_POWER
+    )
+    class_floor_factor = {
+        "forest": 0.95,
+        "building": 0.65,
+        "asphalt_road": 1.15,
+        "dirt_road": 1.05,
+        "water": 0.9,
+        "forest_shadow": 0.8,
+        "building_shadow": 0.85,
+        "shrub": 1.1,
+        "vehicle": 1.2,
+    }
+
+    for cell_info in selected_seeds:
+        y = int(cell_info["y"])
+        x = int(cell_info["x"])
+        seed_mask[y, x] = 1.0
+        local_range_m = max(cell_info["range_m"], range_resolution_m)
+        cross_range_resolution_m = max(local_range_m * np.deg2rad(angular_resolution_deg), meters_per_pixel)
+        cross_range_resolution_px = max(1.0, float(cross_range_resolution_m / meters_per_pixel))
+        cross_resolution_values_px.append(cross_range_resolution_px)
+
+        core_range_sigma_px = float(np.clip(0.08 * range_resolution_px, 1.2, 3.2))
+        core_cross_sigma_px = float(np.clip(0.12 * cross_range_resolution_px, 1.0, 2.6))
+        halo_range_sigma_px = 2.4 * core_range_sigma_px
+        halo_cross_sigma_px = 1.8 * core_cross_sigma_px
+        patch_radius_px = int(np.ceil(4.0 * max(halo_range_sigma_px, halo_cross_sigma_px)))
+        y0 = max(0, y - patch_radius_px)
+        y1 = min(height, y + patch_radius_px + 1)
+        x0 = max(0, x - patch_radius_px)
+        x1 = min(width, x + patch_radius_px + 1)
+
+        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        dx_px = xx - float(x)
+        dy_px = yy - float(y)
+        radial_norm_m = float(np.hypot(cell_info["dx_m"], cell_info["dy_m"]))
+        if radial_norm_m < 1e-6:
+            cos_phi = 1.0
+            sin_phi = 0.0
+        else:
+            cos_phi = float(cell_info["dx_m"] / radial_norm_m)
+            sin_phi = float(cell_info["dy_m"] / radial_norm_m)
+        radial_axis_px = dx_px * cos_phi + dy_px * sin_phi
+        tangential_axis_px = -dx_px * sin_phi + dy_px * cos_phi
+        core_kernel = np.exp(
+            -0.5
+            * (
+                (radial_axis_px / max(core_range_sigma_px, 1e-6)) ** 2
+                + (tangential_axis_px / max(core_cross_sigma_px, 1e-6)) ** 2
+            )
+        ).astype(np.float32)
+        halo_kernel = np.exp(
+            -0.5
+            * (
+                (radial_axis_px / max(halo_range_sigma_px, 1e-6)) ** 2
+                + (tangential_axis_px / max(halo_cross_sigma_px, 1e-6)) ** 2
+            )
+        ).astype(np.float32)
+        kernel = (0.84 * core_kernel + 0.16 * halo_kernel).astype(np.float32)
+        local_peak_gain_db = peak_gain_db + _glint_gain_db(
+            class_name=str(cell_info["class_name"]),
+            is_boundary=bool(cell_info["is_boundary"]),
+        )
+        floor_factor = float(class_floor_factor.get(str(cell_info["class_name"]), 1.0))
+        if bool(cell_info["is_boundary"]):
+            floor_factor += 0.35
+        seed_source_power_w = max(
+            float(cell_info["power_w"]),
+            global_seed_floor_w * max(floor_factor, 0.1),
+            _MIN_LINEAR_POWER,
+        )
+        seed_power_w = seed_source_power_w * float(
+            np.asarray(_db_to_linear(local_peak_gain_db)).reshape(-1)[0]
+        )
+        glint_patch = seed_power_w * kernel
+        glint_power_w[y0:y1, x0:x1] += glint_patch
+
+    median_cross_range_resolution_px = (
+        float(np.median(np.asarray(cross_resolution_values_px, dtype=np.float32)))
+        if cross_resolution_values_px
+        else range_resolution_px
+    )
+    base_resolution_px = max(range_resolution_px, median_cross_range_resolution_px)
+    max_spill_px = max(1.0, float(spill_resolution_elements) * base_resolution_px)
+    outside_mask = ~primary_region.astype(bool)
+    outside_distance_px = cv2.distanceTransform(outside_mask.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+    outside_attenuation = np.ones((height, width), dtype=np.float32)
+    outside_attenuation[outside_mask] = np.exp(-outside_distance_px[outside_mask] / max(base_resolution_px, 1.0))
+    outside_attenuation[outside_distance_px > max_spill_px] = 0.0
+    glint_power_w *= outside_attenuation
+
+    selected_glint_count_by_class: Dict[str, int] = {}
+    for cell_info in selected_seeds:
+        key = str(cell_info["class_name"])
+        selected_glint_count_by_class[key] = selected_glint_count_by_class.get(key, 0) + 1
+        if bool(cell_info["is_boundary"]):
+            selected_glint_count_by_class["boundary_bonus"] = selected_glint_count_by_class.get("boundary_bonus", 0) + 1
+
+    positive_glint_values = glint_power_w[glint_power_w > 0.0]
+    ground_offset_m = geometry["ground_offset_m"].astype(np.float32)
+    normalized_offset = ground_offset_m / max(float(ground_offset_m.max()), 1e-6)
+    speckle_gain = (0.68 + 0.32 * (1.0 - np.clip(normalized_offset, 0.0, 1.0) ** 1.35)).astype(np.float32)
+    if positive_glint_values.size > 0:
+        background_noise_scale_w = max(
+            float(np.percentile(positive_glint_values, 3.0)) * 0.8,
+            float(np.percentile(positive_glint_values, 50.0)) * 0.05,
+        )
+    else:
+        background_noise_scale_w = float(np.percentile(candidate_values, 65.0)) * 0.12 if candidate_values.size > 0 else 0.0
+    glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
+    background_noise_w = (
+        background_noise_scale_w
+        * glint_noise_rng.gamma(shape=1.35, scale=1.0 / 1.35, size=glint_power_w.shape).astype(np.float32)
+        * speckle_gain
+    ).astype(np.float32)
+    glint_power_w += background_noise_w
+
+    glint_map = _render_positive_grayscale(glint_power_w)
+    glint_overlay = np.clip(rgb_image.astype(np.float32) + glint_map.astype(np.float32) * 0.85, 0, 255).astype(np.uint8)
+    report: Dict[str, object] = {
+        "applied": True,
+        "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
+        "selected_glint_count": int(len(selected_seeds)),
+        "selected_glint_count_by_class": selected_glint_count_by_class,
+        "angular_resolution_deg": float(angular_resolution_deg),
+        "range_resolution_m": float(range_resolution_m),
+        "range_resolution_px": float(range_resolution_px),
+        "median_cross_range_resolution_px": float(median_cross_range_resolution_px),
+        "spill_resolution_elements": float(spill_resolution_elements),
+        "max_spill_px": float(max_spill_px),
+        "peak_gain_db": float(peak_gain_db),
+        "background_noise_scale_w": float(background_noise_scale_w),
+    }
+    debug_maps = {
+        "seed_mask": seed_mask.astype(np.float32),
+        "candidate_mask": candidate_mask.astype(np.float32),
+        "primary_region": primary_region.astype(np.float32),
+        "outside_attenuation": outside_attenuation.astype(np.float32),
+        "background_noise_w": background_noise_w.astype(np.float32),
+        "speckle_gain": speckle_gain.astype(np.float32),
+        "glint_power_w": glint_power_w.astype(np.float32),
+    }
+    return glint_map, glint_overlay, glint_power_w.astype(np.float32), report, debug_maps
 
 
 def map_radar_equation_to_pixels(
@@ -401,9 +774,14 @@ def map_radar_equation_to_pixels(
     gaussian_noise_std_dbw = float(config.get("gaussian_noise_std_dbw", 0.75))
     raw_noise_seed = config.get("gaussian_noise_seed", 42)
     gaussian_noise_seed = None if raw_noise_seed is None else int(raw_noise_seed)
+    glint_angular_resolution_deg = float(config.get("glint_angular_resolution_deg", 1.0))
+    glint_range_resolution_m = float(config.get("glint_range_resolution_m", 1.5))
+    glint_spill_resolution_elements = float(config.get("glint_spill_resolution_elements", 2.5))
+    glint_peak_gain_db = float(config.get("glint_peak_gain_db", 9.0))
     if receiver_max_level_dbw <= receiver_sensitivity_dbw:
         raise ValueError("receiver_max_level_dbw must be greater than receiver_sensitivity_dbw.")
     use_radar_boundaries = bool(switches.get("use_radar_boundaries", True))
+    use_radar_glints = bool(switches.get("use_radar_glints", True))
     raw_boundary_classes = config.get("boundary_classes", ["forest", "building", "shrub"])
     if isinstance(raw_boundary_classes, Sequence) and not isinstance(raw_boundary_classes, str):
         boundary_classes = [str(value) for value in raw_boundary_classes]
@@ -427,6 +805,7 @@ def map_radar_equation_to_pixels(
             boundary_report,
             boundary_cluster_report,
             boundary_support_region,
+            primary_boundary_mask,
         ) = _build_radar_boundaries(
             rgb_image=rgb_image,
             class_map=class_map,
@@ -449,6 +828,12 @@ def map_radar_equation_to_pixels(
             "kept_pixel_count": 0,
         }
         boundary_support_region = np.zeros(class_map.shape, dtype=bool)
+        primary_boundary_mask = np.zeros(class_map.shape, dtype=bool)
+
+    primary_cluster_region = _estimate_primary_cluster_region(
+        primary_boundary_mask=primary_boundary_mask,
+        fallback_region=boundary_support_region,
+    )
 
     if use_radar_boundaries and np.any(boundary_support_region):
         effective_rcs_map_m2, boundary_scatter_cleanup_report = _apply_boundary_scatter_cleanup(
@@ -497,6 +882,48 @@ def map_radar_equation_to_pixels(
         seed=gaussian_noise_seed,
     )
     received_power_w = _db_to_linear(received_power_dbw)
+    if use_radar_glints and np.any(primary_cluster_region):
+        glint_map, glint_overlay, glint_power_w, glint_report, glint_debug = _build_radar_glints(
+            rgb_image=rgb_image,
+            candidate_mask=primary_cluster_region,
+            boundary_mask=(boundary_map[:, :, 0] > 0),
+            primary_region=primary_cluster_region,
+            class_map=class_map,
+            class_names=class_names,
+            geometry=geometry,
+            base_received_power_w=raw_received_power_w,
+            meters_per_pixel=meters_per_pixel,
+            angular_resolution_deg=glint_angular_resolution_deg,
+            range_resolution_m=glint_range_resolution_m,
+            spill_resolution_elements=glint_spill_resolution_elements,
+            peak_gain_db=glint_peak_gain_db,
+            noise_seed=gaussian_noise_seed,
+        )
+    else:
+        glint_map = np.zeros_like(rgb_image)
+        glint_overlay = rgb_image.copy()
+        glint_power_w = np.zeros(class_map.shape, dtype=np.float32)
+        glint_report = {
+            "applied": False,
+            "candidate_glint_pixels": int(np.count_nonzero(primary_cluster_region)),
+            "selected_glint_count": 0,
+            "angular_resolution_deg": float(glint_angular_resolution_deg),
+            "range_resolution_m": float(glint_range_resolution_m),
+            "range_resolution_px": 0.0,
+            "median_cross_range_resolution_px": 0.0,
+            "spill_resolution_elements": float(glint_spill_resolution_elements),
+            "max_spill_px": 0.0,
+            "peak_gain_db": float(glint_peak_gain_db),
+            "background_noise_scale_w": 0.0,
+        }
+        glint_debug = {
+            "seed_mask": np.zeros(class_map.shape, dtype=np.float32),
+            "candidate_mask": primary_cluster_region.astype(np.float32),
+            "primary_region": primary_cluster_region.astype(np.float32),
+            "outside_attenuation": np.ones(class_map.shape, dtype=np.float32),
+            "background_noise_w": np.zeros(class_map.shape, dtype=np.float32),
+            "glint_power_w": glint_power_w.astype(np.float32),
+        }
     heatmap = _render_grayscale(
         values_dbw=received_power_dbw,
         lower_dbw=receiver_sensitivity_dbw,
@@ -525,6 +952,7 @@ def map_radar_equation_to_pixels(
         "boundary_cluster_report": boundary_cluster_report,
         "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
         "gaussian_noise_report": gaussian_noise_report,
+        "glint_report": glint_report,
         "config": {
             "origin_mode": str(config.get("origin_mode", "image_center")),
             "frequency_ghz": frequency_ghz,
@@ -542,6 +970,10 @@ def map_radar_equation_to_pixels(
             "gaussian_noise_mean_dbw": gaussian_noise_mean_dbw,
             "gaussian_noise_std_dbw": gaussian_noise_std_dbw,
             "gaussian_noise_seed": gaussian_noise_seed,
+            "glint_angular_resolution_deg": glint_angular_resolution_deg,
+            "glint_range_resolution_m": glint_range_resolution_m,
+            "glint_spill_resolution_elements": glint_spill_resolution_elements,
+            "glint_peak_gain_db": glint_peak_gain_db,
         },
         "pipeline_switches": dict(switches),
     }
@@ -554,11 +986,21 @@ def map_radar_equation_to_pixels(
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
+        "radar_glints_map_rgb": glint_map,
+        "radar_glints_overlay_rgb": glint_overlay,
+        "radar_glints_power_w": glint_power_w.astype(np.float32),
         "radar_boundary_map_rgb": boundary_map,
         "radar_boundary_overlay_rgb": boundary_overlay,
         "radar_boundary_cluster_mask": (boundary_map[:, :, 0] > 0).astype(np.float32),
         "radar_boundary_support_region": boundary_support_region.astype(np.float32),
+        "radar_primary_boundary_mask": primary_boundary_mask.astype(np.float32),
+        "radar_primary_cluster_region": primary_cluster_region.astype(np.float32),
     }
+    debug_maps["radar_glint_seed_mask"] = glint_debug["seed_mask"].astype(np.float32)
+    debug_maps["radar_glint_candidate_mask"] = glint_debug["candidate_mask"].astype(np.float32)
+    debug_maps["radar_glint_outside_attenuation"] = glint_debug["outside_attenuation"].astype(np.float32)
+    debug_maps["radar_glint_background_noise_w"] = glint_debug["background_noise_w"].astype(np.float32)
+    debug_maps["radar_glint_speckle_gain"] = glint_debug["speckle_gain"].astype(np.float32)
     for class_name, boundary_values in per_class_boundaries.items():
         debug_maps[f"radar_boundary_{class_name}"] = boundary_values.astype(np.float32)
 
@@ -567,6 +1009,8 @@ def map_radar_equation_to_pixels(
         received_power_dbw=received_power_dbw,
         heatmap=heatmap,
         overlay=overlay,
+        glint_map=glint_map,
+        glint_overlay=glint_overlay,
         boundary_map=boundary_map,
         boundary_overlay=boundary_overlay,
         debug_maps=debug_maps,
