@@ -1,0 +1,30 @@
+{
+  "forest": {
+    "minimum": -8.0,
+    "maximum": -4.0
+  },
+  "building": {
+    "minimum": 0.0,
+    "maximum": 4.0
+  },
+  "asphalt_road": {
+    "minimum": -24.0,
+    "maximum": -18.0
+  },
+  "dirt_road": {
+    "minimum": -13.0,
+    "maximum": -9.0
+  },
+  "water": {
+    "minimum": -28.0,
+    "maximum": -22.0
+  },
+  "shrub": {
+    "minimum": -10.0,
+    "maximum": -6.0
+  },
+  "vehicle": {
+    "minimum": -5.0,
+    "maximum": 13.0
+  }
+}
