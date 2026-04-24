@@ -11,6 +11,11 @@ import numpy as np
 
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 _MIN_LINEAR_POWER = 1e-18
+_SMOOTH_SURFACE_CLASSES = frozenset({"asphalt_road", "water"})
+_ROUGH_SURFACE_CLASSES = frozenset({"dirt_road"})
+_STRUCTURED_SURFACE_CLASSES = frozenset({"building", "building_shadow"})
+_VOLUME_SCATTER_CLASSES = frozenset({"forest", "forest_shadow", "shrub"})
+_POINT_SCATTER_CLASSES = frozenset({"vehicle"})
 
 
 @dataclass(frozen=True)
@@ -102,14 +107,14 @@ def _geometry(
     origin_px: tuple[float, float],
     meters_per_pixel: float,
     antenna_height_m: float,
-    reference_range_m: float,
+    range_bias_m: float,
 ) -> Dict[str, np.ndarray]:
     height, width = shape
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     dx_m = (xx - origin_px[0]) * meters_per_pixel
     dy_m = (yy - origin_px[1]) * meters_per_pixel
     ground_offset_m = np.sqrt(dx_m * dx_m + dy_m * dy_m)
-    line_of_sight_ground_m = reference_range_m + ground_offset_m
+    line_of_sight_ground_m = float(range_bias_m) + ground_offset_m
     slant_range_m = np.sqrt(line_of_sight_ground_m * line_of_sight_ground_m + antenna_height_m * antenna_height_m)
     return {
         "dx_m": dx_m.astype(np.float32),
@@ -278,6 +283,192 @@ def _sample_from_polar(
         + polar_grid[a1, r1] * wa1 * wr1
     )
     return sampled.astype(np.float32)
+
+
+def _convolve_polar_response(polar_source: np.ndarray, angle_kernel: np.ndarray, range_kernel: np.ndarray) -> np.ndarray:
+    polar_response = np.zeros_like(polar_source, dtype=np.float32)
+    angle_center = len(angle_kernel) // 2
+    for kernel_index, kernel_weight in enumerate(angle_kernel.tolist()):
+        shift = kernel_index - angle_center
+        if abs(kernel_weight) < 1e-9:
+            continue
+        polar_response += float(kernel_weight) * np.roll(polar_source, shift=shift, axis=0)
+    return cv2.filter2D(
+        polar_response,
+        ddepth=-1,
+        kernel=range_kernel[np.newaxis, :],
+        borderType=cv2.BORDER_CONSTANT,
+    )
+
+
+def _normalize_feature_map(values: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
+    array = values.astype(np.float32)
+    valid_mask = np.isfinite(array)
+    if mask is not None:
+        valid_mask &= mask.astype(bool)
+    positive = valid_mask & (array > 0.0)
+    if not np.any(positive):
+        return np.zeros_like(array, dtype=np.float32)
+    scale = float(np.percentile(array[positive], 99.0))
+    if scale <= 1e-12:
+        scale = float(array[positive].max())
+    if scale <= 1e-12:
+        return np.zeros_like(array, dtype=np.float32)
+    return (array / scale).clip(0.0, 1.0).astype(np.float32)
+
+
+def _peak_map(values: np.ndarray, kernel_size: int, mask: np.ndarray | None = None) -> np.ndarray:
+    normalized = values.astype(np.float32)
+    dilated = cv2.dilate(normalized, _kernel(kernel_size))
+    peaks = (normalized > 0.0) & np.isclose(normalized, dilated, atol=1e-6)
+    if mask is not None:
+        peaks &= mask.astype(bool)
+    return (normalized * peaks.astype(np.float32)).astype(np.float32)
+
+
+def _build_scattering_gain_map(
+    rgb_image: np.ndarray,
+    class_map: np.ndarray,
+    class_names: Sequence[str],
+    geometry: Mapping[str, np.ndarray],
+    antenna_height_m: float,
+) -> tuple[np.ndarray, Dict[str, object], Dict[str, np.ndarray]]:
+    gray_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    gray_gx = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0, ksize=3)
+    gray_gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1, ksize=3)
+    texture_gradient = cv2.GaussianBlur(np.sqrt(gray_gx * gray_gx + gray_gy * gray_gy), (0, 0), sigmaX=1.2, sigmaY=1.2)
+    roughness_map = _normalize_feature_map(texture_gradient)
+    roughness_peak_map = _peak_map(roughness_map, kernel_size=3)
+
+    ground_offset_m = np.maximum(geometry["ground_offset_m"].astype(np.float32), 1e-6)
+    look_unit_x = (-geometry["dx_m"].astype(np.float32) / ground_offset_m).astype(np.float32)
+    look_unit_y = (-geometry["dy_m"].astype(np.float32) / ground_offset_m).astype(np.float32)
+    look_unit_x[geometry["ground_offset_m"] <= 1e-6] = 0.0
+    look_unit_y[geometry["ground_offset_m"] <= 1e-6] = 0.0
+
+    incidence_cos = (float(antenna_height_m) / np.maximum(geometry["slant_range_m"].astype(np.float32), float(antenna_height_m))).clip(0.0, 1.0)
+    incidence_term = np.sqrt(incidence_cos).astype(np.float32)
+
+    gain_map = np.ones(class_map.shape, dtype=np.float32)
+    edge_facing_map = np.zeros(class_map.shape, dtype=np.float32)
+    corner_strength_map = np.zeros(class_map.shape, dtype=np.float32)
+    edge_peak_map = np.zeros(class_map.shape, dtype=np.float32)
+    roughness_peak_class_map = np.zeros(class_map.shape, dtype=np.float32)
+    corner_peak_map = np.zeros(class_map.shape, dtype=np.float32)
+    class_reports: Dict[str, Dict[str, object]] = {}
+
+    for class_index, class_name in enumerate(class_names):
+        mask = class_map == class_index
+        if not np.any(mask):
+            class_reports[class_name] = {
+                "pixel_count": 0,
+                "mean_gain": 0.0,
+                "max_gain": 0.0,
+                "scattering_regime": "absent",
+            }
+            continue
+
+        smoothed_mask = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigmaX=1.0, sigmaY=1.0)
+        mask_gx = cv2.Sobel(smoothed_mask, cv2.CV_32F, 1, 0, ksize=3)
+        mask_gy = cv2.Sobel(smoothed_mask, cv2.CV_32F, 0, 1, ksize=3)
+        mask_edge_magnitude = np.sqrt(mask_gx * mask_gx + mask_gy * mask_gy)
+        edge_strength = _normalize_feature_map(mask_edge_magnitude, mask=mask | (mask_edge_magnitude > 0.0))
+        edge_norm = np.maximum(mask_edge_magnitude, 1e-6)
+        normal_x = (mask_gx / edge_norm).astype(np.float32)
+        normal_y = (mask_gy / edge_norm).astype(np.float32)
+        edge_facing = (edge_strength * np.abs(normal_x * look_unit_x + normal_y * look_unit_y)).clip(0.0, 1.0).astype(np.float32)
+        edge_facing_map[mask] = edge_facing[mask]
+        edge_peak = _peak_map(edge_facing, kernel_size=5, mask=mask)
+        edge_peak_map[mask] = edge_peak[mask]
+        roughness_peak_class = _peak_map(roughness_map, kernel_size=3, mask=mask)
+        roughness_peak_class_map[mask] = roughness_peak_class[mask]
+
+        corner_strength = np.zeros(class_map.shape, dtype=np.float32)
+        corner_peak = np.zeros(class_map.shape, dtype=np.float32)
+        if class_name in _STRUCTURED_SURFACE_CLASSES or class_name in _POINT_SCATTER_CLASSES:
+            corner_raw = cv2.cornerHarris(smoothed_mask.astype(np.float32), blockSize=2, ksize=3, k=0.04)
+            corner_strength = _normalize_feature_map(np.maximum(corner_raw, 0.0), mask=mask)
+            corner_strength_map[mask] = corner_strength[mask]
+            corner_peak = _peak_map(corner_strength, kernel_size=3, mask=mask)
+            corner_peak_map[mask] = corner_peak[mask]
+
+        roughness_term = (roughness_map * incidence_term).astype(np.float32)
+        if class_name in _SMOOTH_SURFACE_CLASSES:
+            gain_values = np.clip(
+                0.08 * incidence_term[mask]
+                + 1.10 * roughness_peak_class[mask]
+                + 0.25 * edge_peak[mask]
+                + 0.10 * roughness_term[mask],
+                0.0,
+                1.1,
+            )
+            regime = "smooth_surface"
+        elif class_name in _ROUGH_SURFACE_CLASSES:
+            gain_values = np.clip(
+                0.18 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
+                + 0.70 * roughness_peak_class[mask]
+                + 0.20 * edge_peak[mask],
+                0.0,
+                1.1,
+            )
+            regime = "rough_surface"
+        elif class_name in _STRUCTURED_SURFACE_CLASSES:
+            gain_values = np.clip(
+                0.18 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
+                + 0.25 * edge_peak[mask]
+                + 0.85 * corner_peak[mask],
+                0.0,
+                1.35,
+            )
+            regime = "structured_surface"
+        elif class_name in _VOLUME_SCATTER_CLASSES:
+            gain_values = np.clip(
+                0.55 * np.sqrt(np.maximum(roughness_map[mask], incidence_term[mask]))
+                + 0.20 * roughness_peak_class[mask]
+                + 0.08 * edge_peak[mask],
+                0.0,
+                1.15,
+            )
+            regime = "volume_scatter"
+        elif class_name in _POINT_SCATTER_CLASSES:
+            gain_values = np.clip(1.0 + corner_peak[mask] + 0.25 * edge_peak[mask], 1.0, 1.8)
+            regime = "point_scatter"
+        else:
+            gain_values = np.clip(0.35 * roughness_term[mask] + 0.45 * roughness_peak_class[mask] + 0.25 * edge_peak[mask], 0.0, 1.0)
+            regime = "generic_surface"
+
+        gain_map[mask] = gain_values.astype(np.float32)
+        class_reports[class_name] = {
+            "pixel_count": int(mask.sum()),
+            "mean_gain": float(gain_values.mean()),
+            "max_gain": float(gain_values.max()),
+            "mean_edge_facing": float(edge_facing[mask].mean()),
+            "mean_edge_peak": float(edge_peak[mask].mean()),
+            "mean_roughness": float(roughness_map[mask].mean()),
+            "mean_roughness_peak": float(roughness_peak_class[mask].mean()),
+            "mean_incidence_term": float(incidence_term[mask].mean()),
+            "scattering_regime": regime,
+        }
+
+    report: Dict[str, object] = {
+        "model": "class_regime_incidence_orientation",
+        "class_reports": class_reports,
+        "global_mean_gain": float(gain_map.mean()),
+        "global_max_gain": float(gain_map.max()),
+        "global_mean_incidence_term": float(incidence_term.mean()),
+        "global_mean_roughness": float(roughness_map.mean()),
+    }
+    debug_maps = {
+        "gain_map": gain_map.astype(np.float32),
+        "roughness_map": roughness_map.astype(np.float32),
+        "roughness_peak_map": roughness_peak_map.astype(np.float32),
+        "incidence_term": incidence_term.astype(np.float32),
+        "edge_facing_map": edge_facing_map.astype(np.float32),
+        "edge_peak_map": edge_peak_map.astype(np.float32),
+        "corner_strength_map": corner_strength_map.astype(np.float32),
+        "corner_peak_map": corner_peak_map.astype(np.float32),
+    }
+    return gain_map.astype(np.float32), report, debug_maps
 
 
 def _keep_central_boundary_cluster(
@@ -517,6 +708,8 @@ def _build_radar_glints(
     rgb_image: np.ndarray,
     candidate_mask: np.ndarray,
     primary_region: np.ndarray,
+    class_map: np.ndarray,
+    class_names: Sequence[str],
     geometry: Mapping[str, np.ndarray],
     base_received_power_w: np.ndarray,
     meters_per_pixel: float,
@@ -543,7 +736,7 @@ def _build_radar_glints(
         "processing_gain_db": float(peak_gain_db),
         "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0]),
         "source_cell_count": 0,
-        "response_model": "polar_sinc_squared_power",
+        "response_model": "polar_cell_clutter_plus_point_targets",
     }
     default_debug = {
         "seed_mask": zero_float,
@@ -573,6 +766,7 @@ def _build_radar_glints(
     dy_m = geometry["dy_m"][ys, xs].astype(np.float32)
     theta_deg = _polar_angles_deg(dx_m=dx_m, dy_m=dy_m)
     source_power = candidate_source_power[ys, xs].astype(np.float32)
+    source_class_indices = class_map[ys, xs].astype(np.int32)
     if source_power.size == 0 or float(source_power.max()) <= 0.0:
         return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
@@ -601,7 +795,8 @@ def _build_radar_glints(
         num_range_bins=num_range_bins,
         num_angle_bins=num_angle_bins,
     )
-    polar_source = _splat_to_polar(
+
+    polar_source_power = _splat_to_polar(
         values=source_power,
         a0=a0,
         a1=a1,
@@ -613,6 +808,45 @@ def _build_radar_glints(
         wr1=wr1,
         shape=(num_angle_bins, num_range_bins),
     )
+    local_max_kernel = max(3, int(np.ceil(max(range_resolution_px, median_cross_range_resolution_px))))
+    deterministic_class_indices = np.array(
+        sorted(
+            {
+                class_names.index(class_name)
+                for class_name in class_names
+                if class_name in _STRUCTURED_SURFACE_CLASSES or class_name in _POINT_SCATTER_CLASSES
+            }
+        ),
+        dtype=np.int32,
+    )
+    deterministic_source_map = np.zeros_like(candidate_source_power, dtype=np.float32)
+    if deterministic_class_indices.size > 0:
+        deterministic_mask = np.isin(source_class_indices, deterministic_class_indices)
+        if np.any(deterministic_mask):
+            deterministic_source_map[ys[deterministic_mask], xs[deterministic_mask]] = source_power[deterministic_mask]
+    deterministic_peak_map = _peak_map(
+        deterministic_source_map,
+        kernel_size=local_max_kernel,
+        mask=deterministic_source_map > 0.0,
+    )
+    seed_mask = deterministic_peak_map.astype(np.float32)
+    deterministic_peak_values = deterministic_peak_map[ys, xs].astype(np.float32)
+    deterministic_peak_mask = deterministic_peak_values > 0.0
+    if np.any(deterministic_peak_mask):
+        polar_point_source_power = _splat_to_polar(
+            values=deterministic_peak_values[deterministic_peak_mask],
+            a0=a0[deterministic_peak_mask],
+            a1=a1[deterministic_peak_mask],
+            r0=r0[deterministic_peak_mask],
+            r1=r1[deterministic_peak_mask],
+            wa0=wa0[deterministic_peak_mask],
+            wa1=wa1[deterministic_peak_mask],
+            wr0=wr0[deterministic_peak_mask],
+            wr1=wr1[deterministic_peak_mask],
+            shape=(num_angle_bins, num_range_bins),
+        )
+    else:
+        polar_point_source_power = np.zeros((num_angle_bins, num_range_bins), dtype=np.float32)
 
     range_offsets_m = np.arange(
         -3.0 * float(range_resolution_m),
@@ -631,29 +865,34 @@ def _build_radar_glints(
     range_kernel /= max(float(range_kernel.sum()), 1e-12)
     angle_kernel /= max(float(angle_kernel.sum()), 1e-12)
 
-    polar_response = np.zeros_like(polar_source, dtype=np.float32)
-    angle_center = len(angle_kernel) // 2
-    for kernel_index, kernel_weight in enumerate(angle_kernel.tolist()):
-        shift = kernel_index - angle_center
-        if abs(kernel_weight) < 1e-9:
-            continue
-        polar_response += float(kernel_weight) * np.roll(polar_source, shift=shift, axis=0)
-    polar_response = cv2.filter2D(
-        polar_response,
-        ddepth=-1,
-        kernel=range_kernel[np.newaxis, :],
-        borderType=cv2.BORDER_CONSTANT,
-    )
-    polar_response *= float(np.asarray(_db_to_linear(peak_gain_db)).reshape(-1)[0])
+    processing_gain_linear = float(np.asarray(_db_to_linear(peak_gain_db)).reshape(-1)[0])
+    polar_clutter_mean_power = (
+        _convolve_polar_response(
+            polar_source=polar_source_power,
+            angle_kernel=angle_kernel,
+            range_kernel=range_kernel,
+        )
+        * processing_gain_linear
+    ).astype(np.float32)
+    polar_point_response_power = (
+        _convolve_polar_response(
+            polar_source=polar_point_source_power,
+            angle_kernel=angle_kernel,
+            range_kernel=range_kernel,
+        )
+        * processing_gain_linear
+    ).astype(np.float32)
+    glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
+    polar_clutter_power = (
+        polar_clutter_mean_power
+        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_clutter_mean_power.shape).astype(np.float32)
+    ).astype(np.float32)
 
     receiver_floor_w = float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0])
-    glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
-    polar_speckle = glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_response.shape).astype(np.float32)
     polar_floor = (
         receiver_floor_w
-        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_response.shape).astype(np.float32)
+        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_clutter_mean_power.shape).astype(np.float32)
     )
-    polar_signal = (polar_response * polar_speckle).astype(np.float32)
 
     full_range_m = geometry["slant_range_m"].astype(np.float32)
     full_angle_deg = _polar_angles_deg(
@@ -669,8 +908,10 @@ def _build_radar_glints(
         num_angle_bins=num_angle_bins,
     )
 
+    polar_response_power = (polar_clutter_power + polar_point_response_power).astype(np.float32)
+
     glint_signal_w = _sample_from_polar(
-        polar_grid=polar_signal,
+        polar_grid=polar_response_power,
         a0=full_a0,
         a1=full_a1,
         r0=full_r0,
@@ -692,7 +933,7 @@ def _build_radar_glints(
         wr1=full_wr1,
     )
     speckle_gain = _sample_from_polar(
-        polar_grid=polar_speckle,
+        polar_grid=(polar_clutter_power / np.maximum(polar_clutter_mean_power, _MIN_LINEAR_POWER)).astype(np.float32),
         a0=full_a0,
         a1=full_a1,
         r0=full_r0,
@@ -726,6 +967,7 @@ def _build_radar_glints(
         "applied": True,
         "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
         "selected_glint_count": source_cell_count,
+        "dominant_scatterer_count": int(np.count_nonzero(seed_mask)),
         "angular_resolution_deg": float(angular_resolution_deg),
         "range_resolution_m": float(range_resolution_m),
         "range_resolution_px": float(range_resolution_px),
@@ -737,7 +979,9 @@ def _build_radar_glints(
         "polar_range_sample_m": float(range_sample_m),
         "polar_angular_sample_deg": float(angular_sample_deg),
         "source_cell_count": source_cell_count,
-        "response_model": "polar_sinc_squared_power",
+        "local_peak_kernel_px": int(local_max_kernel),
+        "deterministic_peak_count": int(np.count_nonzero(deterministic_peak_map)),
+        "response_model": "polar_cell_clutter_plus_point_targets",
     }
     debug_maps = {
         "seed_mask": seed_mask.astype(np.float32),
@@ -746,8 +990,8 @@ def _build_radar_glints(
         "outside_attenuation": outside_attenuation.astype(np.float32),
         "background_noise_w": background_noise_w.astype(np.float32),
         "speckle_gain": speckle_gain.astype(np.float32),
-        "polar_source_power": polar_source.astype(np.float32),
-        "polar_response_power": polar_signal.astype(np.float32),
+        "polar_source_power": polar_source_power.astype(np.float32),
+        "polar_response_power": polar_response_power.astype(np.float32),
         "glint_power_w": glint_power_w.astype(np.float32),
     }
     return glint_map, glint_overlay, glint_power_w.astype(np.float32), report, debug_maps
@@ -791,6 +1035,7 @@ def map_radar_equation_to_pixels(
         boundary_classes = ["forest", "building", "shrub"]
     boundary_thickness_px = int(config.get("boundary_thickness_px", 2))
     boundary_cluster_center_radius_px = float(config.get("boundary_cluster_center_radius_px", 0.35 * min(rgb_image.shape[:2])))
+    origin_mode = str(config.get("origin_mode", "image_center")).lower()
 
     origin_px = _resolve_radar_origin(
         config=config,
@@ -856,7 +1101,14 @@ def map_radar_equation_to_pixels(
         origin_px=origin_px,
         meters_per_pixel=meters_per_pixel,
         antenna_height_m=antenna_height_m,
-        reference_range_m=reference_range_m,
+        range_bias_m=0.0 if origin_mode == "image_center" else reference_range_m,
+    )
+    scattering_gain_map, scattering_model_report, scattering_debug = _build_scattering_gain_map(
+        rgb_image=rgb_image,
+        class_map=class_map,
+        class_names=class_names,
+        geometry=geometry,
+        antenna_height_m=antenna_height_m,
     )
 
     wavelength_m = SPEED_OF_LIGHT_M_S / (frequency_ghz * 1e9)
@@ -874,6 +1126,7 @@ def map_radar_equation_to_pixels(
         radar_constant
         * np.maximum(effective_rcs_map_m2, 0.0)
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
+        * np.maximum(scattering_gain_map, 0.0)
     ).astype(np.float32)
     raw_received_power_w = received_power_w.copy()
     raw_received_power_dbw = _linear_to_db(raw_received_power_w)
@@ -889,6 +1142,8 @@ def map_radar_equation_to_pixels(
             rgb_image=rgb_image,
             candidate_mask=primary_cluster_region,
             primary_region=primary_cluster_region,
+            class_map=class_map,
+            class_names=class_names,
             geometry=geometry,
             base_received_power_w=raw_received_power_w,
             meters_per_pixel=meters_per_pixel,
@@ -916,7 +1171,7 @@ def map_radar_equation_to_pixels(
             "processing_gain_db": float(glint_peak_gain_db),
             "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_sensitivity_dbw)).reshape(-1)[0]),
             "source_cell_count": 0,
-            "response_model": "polar_sinc_squared_power",
+            "response_model": "polar_cell_clutter_plus_point_targets",
         }
         glint_debug = {
             "seed_mask": np.zeros(class_map.shape, dtype=np.float32),
@@ -945,6 +1200,7 @@ def map_radar_equation_to_pixels(
         "radar_constant": float(radar_constant),
         "config_path": str(config["config_path"]),
         "origin_px": [float(origin_px[0]), float(origin_px[1])],
+        "geometry_range_bias_m": float(0.0 if origin_mode == "image_center" else reference_range_m),
         "visual_black_level_dbw": float(receiver_sensitivity_dbw),
         "visual_white_level_dbw": float(receiver_max_level_dbw),
     }
@@ -954,10 +1210,11 @@ def map_radar_equation_to_pixels(
         "boundary_report": boundary_report,
         "boundary_cluster_report": boundary_cluster_report,
         "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
+        "scattering_model_report": scattering_model_report,
         "gaussian_noise_report": gaussian_noise_report,
         "glint_report": glint_report,
         "config": {
-            "origin_mode": str(config.get("origin_mode", "image_center")),
+            "origin_mode": origin_mode,
             "frequency_ghz": frequency_ghz,
             "transmit_power_w": transmit_power_w,
             "antenna_gain_db": antenna_gain_db,
@@ -984,6 +1241,11 @@ def map_radar_equation_to_pixels(
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
         "radar_ground_offset_m": geometry["ground_offset_m"].astype(np.float32),
         "radar_effective_rcs_map_m2": effective_rcs_map_m2.astype(np.float32),
+        "radar_scattering_gain_map": scattering_gain_map.astype(np.float32),
+        "radar_scattering_roughness_map": scattering_debug["roughness_map"].astype(np.float32),
+        "radar_scattering_incidence_term": scattering_debug["incidence_term"].astype(np.float32),
+        "radar_scattering_edge_facing_map": scattering_debug["edge_facing_map"].astype(np.float32),
+        "radar_scattering_corner_strength_map": scattering_debug["corner_strength_map"].astype(np.float32),
         "radar_received_power_dbw_raw": raw_received_power_dbw.astype(np.float32),
         "radar_white_gaussian_noise_dbw": noise_dbw.astype(np.float32),
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
