@@ -14,15 +14,15 @@ from rgb2radio.terrain_resnet import export_training_debug_images, train_terrain
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a weakly-supervised terrain ResNet on the optical image.")
+    parser = argparse.ArgumentParser(description="Train the terrain ResNet used by the territory segmentation pipeline.")
     parser.add_argument(
         "--optical",
         type=Path,
         default=None,
-        help="Path to optical RGB image. Defaults to real_data.png or data/raw/optical/real_data.png",
+        help="Path to optical RGB image. Defaults to real_data.png.",
     )
     parser.add_argument("--output-model", type=Path, default=Path("outputs/models/terrain_resnet.pt"))
-    parser.add_argument("--debug-dir", type=Path, default=Path("outputs/debug/training"))
+    parser.add_argument("--debug-dir", type=Path, default=Path("output_debug/training"))
     parser.add_argument("--patch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -35,7 +35,6 @@ def main() -> None:
     optical_path = args.optical or resolve_existing_path(
         [
             PROJECT_ROOT / "real_data.png",
-            PROJECT_ROOT / "data/raw/optical/real_data.png",
         ]
     )
 
