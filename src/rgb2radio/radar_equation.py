@@ -197,23 +197,6 @@ def _render_positive_grayscale(values_linear: np.ndarray) -> np.ndarray:
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
-def _glint_gain_db(class_name: str, is_boundary: bool) -> float:
-    class_gain_db = {
-        "forest": 6.0,
-        "building": 6.0,
-        "asphalt_road": 8.5,
-        "dirt_road": 7.5,
-        "water": 4.5,
-        "forest_shadow": 4.0,
-        "building_shadow": 4.5,
-        "shrub": 8.0,
-        "vehicle": 8.5,
-    }.get(class_name, 5.0)
-    if is_boundary:
-        class_gain_db += 3.0
-    return float(class_gain_db)
-
-
 def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float) -> np.ndarray:
     finite = np.isfinite(values_dbw)
     if not np.any(finite):
@@ -223,6 +206,78 @@ def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float
     scaled = ((values_dbw - lower_dbw) / (upper_dbw - lower_dbw)).clip(0.0, 1.0)
     gray = (scaled * 255.0).astype(np.uint8)
     return np.repeat(gray[:, :, None], 3, axis=2)
+
+
+def _polar_angles_deg(dx_m: np.ndarray, dy_m: np.ndarray) -> np.ndarray:
+    return ((np.degrees(np.arctan2(dy_m.astype(np.float32), dx_m.astype(np.float32))) + 360.0) % 360.0).astype(
+        np.float32
+    )
+
+
+def _polar_bilinear_coordinates(
+    range_m: np.ndarray,
+    angle_deg: np.ndarray,
+    range_sample_m: float,
+    angular_sample_deg: float,
+    num_range_bins: int,
+    num_angle_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    safe_range_sample_m = max(float(range_sample_m), 1e-6)
+    safe_angular_sample_deg = max(float(angular_sample_deg), 1e-6)
+    range_coord = (range_m.astype(np.float32) / safe_range_sample_m).astype(np.float32)
+    angle_coord = (angle_deg.astype(np.float32) / safe_angular_sample_deg).astype(np.float32)
+    range_floor = np.floor(range_coord).astype(np.int32)
+    angle_floor = np.floor(angle_coord).astype(np.int32) % int(num_angle_bins)
+    r0 = np.clip(range_floor, 0, int(num_range_bins) - 1)
+    r1 = np.clip(range_floor + 1, 0, int(num_range_bins) - 1)
+    a0 = angle_floor
+    a1 = (a0 + 1) % int(num_angle_bins)
+    wr1 = (range_coord - range_floor).astype(np.float32)
+    wr0 = (1.0 - wr1).astype(np.float32)
+    wa1 = (angle_coord - np.floor(angle_coord)).astype(np.float32)
+    wa0 = (1.0 - wa1).astype(np.float32)
+    return a0, a1, r0, r1, wa0, wa1, wr0, wr1
+
+
+def _splat_to_polar(
+    values: np.ndarray,
+    a0: np.ndarray,
+    a1: np.ndarray,
+    r0: np.ndarray,
+    r1: np.ndarray,
+    wa0: np.ndarray,
+    wa1: np.ndarray,
+    wr0: np.ndarray,
+    wr1: np.ndarray,
+    shape: tuple[int, int],
+) -> np.ndarray:
+    polar_grid = np.zeros(shape, dtype=np.float32)
+    sample_values = values.astype(np.float32)
+    np.add.at(polar_grid, (a0, r0), sample_values * wa0 * wr0)
+    np.add.at(polar_grid, (a1, r0), sample_values * wa1 * wr0)
+    np.add.at(polar_grid, (a0, r1), sample_values * wa0 * wr1)
+    np.add.at(polar_grid, (a1, r1), sample_values * wa1 * wr1)
+    return polar_grid
+
+
+def _sample_from_polar(
+    polar_grid: np.ndarray,
+    a0: np.ndarray,
+    a1: np.ndarray,
+    r0: np.ndarray,
+    r1: np.ndarray,
+    wa0: np.ndarray,
+    wa1: np.ndarray,
+    wr0: np.ndarray,
+    wr1: np.ndarray,
+) -> np.ndarray:
+    sampled = (
+        polar_grid[a0, r0] * wa0 * wr0
+        + polar_grid[a1, r0] * wa1 * wr0
+        + polar_grid[a0, r1] * wa0 * wr1
+        + polar_grid[a1, r1] * wa1 * wr1
+    )
+    return sampled.astype(np.float32)
 
 
 def _keep_central_boundary_cluster(
@@ -461,10 +516,7 @@ def _build_radar_boundaries(
 def _build_radar_glints(
     rgb_image: np.ndarray,
     candidate_mask: np.ndarray,
-    boundary_mask: np.ndarray,
     primary_region: np.ndarray,
-    class_map: np.ndarray,
-    class_names: Sequence[str],
     geometry: Mapping[str, np.ndarray],
     base_received_power_w: np.ndarray,
     meters_per_pixel: float,
@@ -472,6 +524,7 @@ def _build_radar_glints(
     range_resolution_m: float,
     spill_resolution_elements: float,
     peak_gain_db: float,
+    receiver_floor_dbw: float,
     noise_seed: int | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, object], Dict[str, np.ndarray]]:
     height, width = candidate_mask.shape
@@ -481,15 +534,16 @@ def _build_radar_glints(
         "applied": False,
         "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
         "selected_glint_count": 0,
-        "selected_glint_count_by_class": {},
         "angular_resolution_deg": float(angular_resolution_deg),
         "range_resolution_m": float(range_resolution_m),
         "range_resolution_px": 0.0,
         "median_cross_range_resolution_px": 0.0,
         "spill_resolution_elements": float(spill_resolution_elements),
         "max_spill_px": 0.0,
-        "peak_gain_db": float(peak_gain_db),
-        "background_noise_scale_w": 0.0,
+        "processing_gain_db": float(peak_gain_db),
+        "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0]),
+        "source_cell_count": 0,
+        "response_model": "polar_sinc_squared_power",
     }
     default_debug = {
         "seed_mask": zero_float,
@@ -509,235 +563,181 @@ def _build_radar_glints(
     ):
         return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
+    candidate_source_power = np.zeros_like(base_received_power_w, dtype=np.float32)
+    candidate_source_power[candidate_mask.astype(bool)] = base_received_power_w[candidate_mask.astype(bool)].astype(np.float32)
+    seed_mask = (candidate_source_power > 0.0).astype(np.float32)
+
     ys, xs = np.nonzero(candidate_mask)
-    range_m = geometry["line_of_sight_ground_m"][ys, xs]
-    dx_m = geometry["dx_m"][ys, xs]
-    dy_m = geometry["dy_m"][ys, xs]
-    angle_deg = (np.degrees(np.arctan2(dy_m, dx_m)) + 360.0) % 360.0
-    angle_bins = np.floor(angle_deg / angular_resolution_deg).astype(np.int32)
-    range_bins = np.floor(range_m / range_resolution_m).astype(np.int32)
-
-    class_pixels_per_seed = {
-        "forest": 320,
-        "building": 110,
-        "asphalt_road": 55,
-        "dirt_road": 75,
-        "water": 150,
-        "forest_shadow": 180,
-        "building_shadow": 140,
-        "shrub": 70,
-        "vehicle": 20,
-    }
-    class_max_per_cell = {
-        "forest": 1,
-        "building": 2,
-        "asphalt_road": 5,
-        "dirt_road": 4,
-        "water": 2,
-        "forest_shadow": 2,
-        "building_shadow": 2,
-        "shrub": 4,
-        "vehicle": 2,
-    }
-    boundary_pixels_per_seed = 60
-    boundary_max_per_cell = 3
-    class_name_by_candidate = [str(class_names[int(class_map[int(y), int(x)])]) for y, x in zip(ys, xs)]
-    boundary_flag_by_candidate = boundary_mask[ys, xs].astype(bool)
-
-    class_groups: Dict[tuple[int, int, str], list[int]] = {}
-    boundary_groups: Dict[tuple[int, int], list[int]] = {}
-    for idx in range(len(xs)):
-        angle_bin = int(angle_bins[idx])
-        range_bin = int(range_bins[idx])
-        class_name = class_name_by_candidate[idx]
-        class_groups.setdefault((angle_bin, range_bin, class_name), []).append(idx)
-        if boundary_flag_by_candidate[idx]:
-            boundary_groups.setdefault((angle_bin, range_bin), []).append(idx)
-
-    selected_seeds: list[Dict[str, float | str | bool]] = []
-    selected_seed_registry: Dict[tuple[int, int, str], Dict[str, float | str | bool]] = {}
-
-    def _register_seed(candidate_idx: int, force_boundary: bool) -> None:
-        y = int(ys[candidate_idx])
-        x = int(xs[candidate_idx])
-        class_name = class_name_by_candidate[candidate_idx]
-        registry_key = (y, x, class_name)
-        existing = selected_seed_registry.get(registry_key)
-        if existing is not None:
-            if force_boundary:
-                existing["is_boundary"] = True
-            return
-        payload: Dict[str, float | str | bool] = {
-            "y": float(y),
-            "x": float(x),
-            "power_w": float(base_received_power_w[y, x]),
-            "range_m": float(range_m[candidate_idx]),
-            "dx_m": float(dx_m[candidate_idx]),
-            "dy_m": float(dy_m[candidate_idx]),
-            "class_name": class_name,
-            "is_boundary": bool(force_boundary),
-        }
-        selected_seed_registry[registry_key] = payload
-        selected_seeds.append(payload)
-
-    for (angle_bin, range_bin, class_name), group_indices in class_groups.items():
-        power_sorted = sorted(group_indices, key=lambda idx: float(base_received_power_w[int(ys[idx]), int(xs[idx])]), reverse=True)
-        pixels_per_seed = int(class_pixels_per_seed.get(class_name, 140))
-        max_per_cell = int(class_max_per_cell.get(class_name, 2))
-        selected_count = min(max_per_cell, max(1, int(np.ceil(len(group_indices) / max(pixels_per_seed, 1)))))
-        for candidate_idx in power_sorted[:selected_count]:
-            _register_seed(candidate_idx=candidate_idx, force_boundary=False)
-
-    for (_angle_bin, _range_bin), group_indices in boundary_groups.items():
-        power_sorted = sorted(group_indices, key=lambda idx: float(base_received_power_w[int(ys[idx]), int(xs[idx])]), reverse=True)
-        selected_count = min(boundary_max_per_cell, max(1, int(np.ceil(len(group_indices) / max(boundary_pixels_per_seed, 1)))))
-        for candidate_idx in power_sorted[:selected_count]:
-            _register_seed(candidate_idx=candidate_idx, force_boundary=True)
-
-    if not selected_seeds:
+    range_m = geometry["slant_range_m"][ys, xs].astype(np.float32)
+    dx_m = geometry["dx_m"][ys, xs].astype(np.float32)
+    dy_m = geometry["dy_m"][ys, xs].astype(np.float32)
+    theta_deg = _polar_angles_deg(dx_m=dx_m, dy_m=dy_m)
+    source_power = candidate_source_power[ys, xs].astype(np.float32)
+    if source_power.size == 0 or float(source_power.max()) <= 0.0:
         return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
-    glint_power_w = np.zeros((height, width), dtype=np.float32)
-    seed_mask = np.zeros((height, width), dtype=np.float32)
     range_resolution_px = max(1.0, float(range_resolution_m / meters_per_pixel))
-    cross_resolution_values_px = []
-    candidate_values = base_received_power_w[candidate_mask.astype(bool)]
-    global_seed_floor_w = (
-        float(np.percentile(candidate_values, 70.0))
-        if candidate_values.size > 0
-        else _MIN_LINEAR_POWER
-    )
-    class_floor_factor = {
-        "forest": 0.95,
-        "building": 0.65,
-        "asphalt_road": 1.15,
-        "dirt_road": 1.05,
-        "water": 0.9,
-        "forest_shadow": 0.8,
-        "building_shadow": 0.85,
-        "shrub": 1.1,
-        "vehicle": 1.2,
-    }
-
-    for cell_info in selected_seeds:
-        y = int(cell_info["y"])
-        x = int(cell_info["x"])
-        seed_mask[y, x] = 1.0
-        local_range_m = max(cell_info["range_m"], range_resolution_m)
-        cross_range_resolution_m = max(local_range_m * np.deg2rad(angular_resolution_deg), meters_per_pixel)
-        cross_range_resolution_px = max(1.0, float(cross_range_resolution_m / meters_per_pixel))
-        cross_resolution_values_px.append(cross_range_resolution_px)
-
-        core_range_sigma_px = float(np.clip(0.08 * range_resolution_px, 1.2, 3.2))
-        core_cross_sigma_px = float(np.clip(0.12 * cross_range_resolution_px, 1.0, 2.6))
-        halo_range_sigma_px = 2.4 * core_range_sigma_px
-        halo_cross_sigma_px = 1.8 * core_cross_sigma_px
-        patch_radius_px = int(np.ceil(4.0 * max(halo_range_sigma_px, halo_cross_sigma_px)))
-        y0 = max(0, y - patch_radius_px)
-        y1 = min(height, y + patch_radius_px + 1)
-        x0 = max(0, x - patch_radius_px)
-        x1 = min(width, x + patch_radius_px + 1)
-
-        yy, xx = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-        dx_px = xx - float(x)
-        dy_px = yy - float(y)
-        radial_norm_m = float(np.hypot(cell_info["dx_m"], cell_info["dy_m"]))
-        if radial_norm_m < 1e-6:
-            cos_phi = 1.0
-            sin_phi = 0.0
-        else:
-            cos_phi = float(cell_info["dx_m"] / radial_norm_m)
-            sin_phi = float(cell_info["dy_m"] / radial_norm_m)
-        radial_axis_px = dx_px * cos_phi + dy_px * sin_phi
-        tangential_axis_px = -dx_px * sin_phi + dy_px * cos_phi
-        core_kernel = np.exp(
-            -0.5
-            * (
-                (radial_axis_px / max(core_range_sigma_px, 1e-6)) ** 2
-                + (tangential_axis_px / max(core_cross_sigma_px, 1e-6)) ** 2
-            )
-        ).astype(np.float32)
-        halo_kernel = np.exp(
-            -0.5
-            * (
-                (radial_axis_px / max(halo_range_sigma_px, 1e-6)) ** 2
-                + (tangential_axis_px / max(halo_cross_sigma_px, 1e-6)) ** 2
-            )
-        ).astype(np.float32)
-        kernel = (0.84 * core_kernel + 0.16 * halo_kernel).astype(np.float32)
-        local_peak_gain_db = peak_gain_db + _glint_gain_db(
-            class_name=str(cell_info["class_name"]),
-            is_boundary=bool(cell_info["is_boundary"]),
-        )
-        floor_factor = float(class_floor_factor.get(str(cell_info["class_name"]), 1.0))
-        if bool(cell_info["is_boundary"]):
-            floor_factor += 0.35
-        seed_source_power_w = max(
-            float(cell_info["power_w"]),
-            global_seed_floor_w * max(floor_factor, 0.1),
-            _MIN_LINEAR_POWER,
-        )
-        seed_power_w = seed_source_power_w * float(
-            np.asarray(_db_to_linear(local_peak_gain_db)).reshape(-1)[0]
-        )
-        glint_patch = seed_power_w * kernel
-        glint_power_w[y0:y1, x0:x1] += glint_patch
-
+    cross_range_resolution_m = np.maximum(
+        range_m * np.deg2rad(float(angular_resolution_deg)),
+        meters_per_pixel,
+    ).astype(np.float32)
     median_cross_range_resolution_px = (
-        float(np.median(np.asarray(cross_resolution_values_px, dtype=np.float32)))
-        if cross_resolution_values_px
-        else range_resolution_px
+        float(np.median(cross_range_resolution_m / meters_per_pixel)) if cross_range_resolution_m.size else 1.0
     )
     base_resolution_px = max(range_resolution_px, median_cross_range_resolution_px)
     max_spill_px = max(1.0, float(spill_resolution_elements) * base_resolution_px)
+
+    range_sample_m = min(meters_per_pixel, float(range_resolution_m) / 4.0)
+    angular_sample_deg = float(angular_resolution_deg) / 4.0
+    max_range_m = float(geometry["slant_range_m"].max()) + 3.0 * float(range_resolution_m)
+    num_range_bins = max(8, int(np.ceil(max_range_m / max(range_sample_m, 1e-6))) + 2)
+    num_angle_bins = max(32, int(np.ceil(360.0 / max(angular_sample_deg, 1e-6))))
+
+    a0, a1, r0, r1, wa0, wa1, wr0, wr1 = _polar_bilinear_coordinates(
+        range_m=range_m,
+        angle_deg=theta_deg,
+        range_sample_m=range_sample_m,
+        angular_sample_deg=angular_sample_deg,
+        num_range_bins=num_range_bins,
+        num_angle_bins=num_angle_bins,
+    )
+    polar_source = _splat_to_polar(
+        values=source_power,
+        a0=a0,
+        a1=a1,
+        r0=r0,
+        r1=r1,
+        wa0=wa0,
+        wa1=wa1,
+        wr0=wr0,
+        wr1=wr1,
+        shape=(num_angle_bins, num_range_bins),
+    )
+
+    range_offsets_m = np.arange(
+        -3.0 * float(range_resolution_m),
+        3.0 * float(range_resolution_m) + range_sample_m * 0.5,
+        range_sample_m,
+        dtype=np.float32,
+    )
+    angle_offsets_deg = np.arange(
+        -3.0 * float(angular_resolution_deg),
+        3.0 * float(angular_resolution_deg) + angular_sample_deg * 0.5,
+        angular_sample_deg,
+        dtype=np.float32,
+    )
+    range_kernel = np.sinc(range_offsets_m / max(float(range_resolution_m), 1e-6)).astype(np.float32) ** 2
+    angle_kernel = np.sinc(angle_offsets_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.float32) ** 2
+    range_kernel /= max(float(range_kernel.sum()), 1e-12)
+    angle_kernel /= max(float(angle_kernel.sum()), 1e-12)
+
+    polar_response = np.zeros_like(polar_source, dtype=np.float32)
+    angle_center = len(angle_kernel) // 2
+    for kernel_index, kernel_weight in enumerate(angle_kernel.tolist()):
+        shift = kernel_index - angle_center
+        if abs(kernel_weight) < 1e-9:
+            continue
+        polar_response += float(kernel_weight) * np.roll(polar_source, shift=shift, axis=0)
+    polar_response = cv2.filter2D(
+        polar_response,
+        ddepth=-1,
+        kernel=range_kernel[np.newaxis, :],
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    polar_response *= float(np.asarray(_db_to_linear(peak_gain_db)).reshape(-1)[0])
+
+    receiver_floor_w = float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0])
+    glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
+    polar_speckle = glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_response.shape).astype(np.float32)
+    polar_floor = (
+        receiver_floor_w
+        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_response.shape).astype(np.float32)
+    )
+    polar_signal = (polar_response * polar_speckle).astype(np.float32)
+
+    full_range_m = geometry["slant_range_m"].astype(np.float32)
+    full_angle_deg = _polar_angles_deg(
+        dx_m=geometry["dx_m"].astype(np.float32),
+        dy_m=geometry["dy_m"].astype(np.float32),
+    )
+    full_a0, full_a1, full_r0, full_r1, full_wa0, full_wa1, full_wr0, full_wr1 = _polar_bilinear_coordinates(
+        range_m=full_range_m,
+        angle_deg=full_angle_deg,
+        range_sample_m=range_sample_m,
+        angular_sample_deg=angular_sample_deg,
+        num_range_bins=num_range_bins,
+        num_angle_bins=num_angle_bins,
+    )
+
+    glint_signal_w = _sample_from_polar(
+        polar_grid=polar_signal,
+        a0=full_a0,
+        a1=full_a1,
+        r0=full_r0,
+        r1=full_r1,
+        wa0=full_wa0,
+        wa1=full_wa1,
+        wr0=full_wr0,
+        wr1=full_wr1,
+    )
+    background_noise_w = _sample_from_polar(
+        polar_grid=polar_floor,
+        a0=full_a0,
+        a1=full_a1,
+        r0=full_r0,
+        r1=full_r1,
+        wa0=full_wa0,
+        wa1=full_wa1,
+        wr0=full_wr0,
+        wr1=full_wr1,
+    )
+    speckle_gain = _sample_from_polar(
+        polar_grid=polar_speckle,
+        a0=full_a0,
+        a1=full_a1,
+        r0=full_r0,
+        r1=full_r1,
+        wa0=full_wa0,
+        wa1=full_wa1,
+        wr0=full_wr0,
+        wr1=full_wr1,
+    )
+
     outside_mask = ~primary_region.astype(bool)
     outside_distance_px = cv2.distanceTransform(outside_mask.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
     outside_attenuation = np.ones((height, width), dtype=np.float32)
     outside_attenuation[outside_mask] = np.exp(-outside_distance_px[outside_mask] / max(base_resolution_px, 1.0))
     outside_attenuation[outside_distance_px > max_spill_px] = 0.0
-    glint_power_w *= outside_attenuation
+    glint_power_w = (glint_signal_w * outside_attenuation + background_noise_w).astype(np.float32)
 
-    selected_glint_count_by_class: Dict[str, int] = {}
-    for cell_info in selected_seeds:
-        key = str(cell_info["class_name"])
-        selected_glint_count_by_class[key] = selected_glint_count_by_class.get(key, 0) + 1
-        if bool(cell_info["is_boundary"]):
-            selected_glint_count_by_class["boundary_bonus"] = selected_glint_count_by_class.get("boundary_bonus", 0) + 1
-
-    positive_glint_values = glint_power_w[glint_power_w > 0.0]
-    ground_offset_m = geometry["ground_offset_m"].astype(np.float32)
-    normalized_offset = ground_offset_m / max(float(ground_offset_m.max()), 1e-6)
-    speckle_gain = (0.68 + 0.32 * (1.0 - np.clip(normalized_offset, 0.0, 1.0) ** 1.35)).astype(np.float32)
-    if positive_glint_values.size > 0:
-        background_noise_scale_w = max(
-            float(np.percentile(positive_glint_values, 3.0)) * 0.8,
-            float(np.percentile(positive_glint_values, 50.0)) * 0.05,
-        )
-    else:
-        background_noise_scale_w = float(np.percentile(candidate_values, 65.0)) * 0.12 if candidate_values.size > 0 else 0.0
-    glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
-    background_noise_w = (
-        background_noise_scale_w
-        * glint_noise_rng.gamma(shape=1.35, scale=1.0 / 1.35, size=glint_power_w.shape).astype(np.float32)
-        * speckle_gain
-    ).astype(np.float32)
-    glint_power_w += background_noise_w
+    source_cell_ids = np.stack(
+        [
+            np.floor(theta_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.int32),
+            np.floor(range_m / max(float(range_resolution_m), 1e-6)).astype(np.int32),
+        ],
+        axis=1,
+    )
+    source_cell_count = int(np.unique(source_cell_ids, axis=0).shape[0]) if source_cell_ids.size else 0
+    background_noise_scale_w = receiver_floor_w
 
     glint_map = _render_positive_grayscale(glint_power_w)
     glint_overlay = np.clip(rgb_image.astype(np.float32) + glint_map.astype(np.float32) * 0.85, 0, 255).astype(np.uint8)
     report: Dict[str, object] = {
         "applied": True,
         "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
-        "selected_glint_count": int(len(selected_seeds)),
-        "selected_glint_count_by_class": selected_glint_count_by_class,
+        "selected_glint_count": source_cell_count,
         "angular_resolution_deg": float(angular_resolution_deg),
         "range_resolution_m": float(range_resolution_m),
         "range_resolution_px": float(range_resolution_px),
         "median_cross_range_resolution_px": float(median_cross_range_resolution_px),
         "spill_resolution_elements": float(spill_resolution_elements),
         "max_spill_px": float(max_spill_px),
-        "peak_gain_db": float(peak_gain_db),
+        "processing_gain_db": float(peak_gain_db),
         "background_noise_scale_w": float(background_noise_scale_w),
+        "polar_range_sample_m": float(range_sample_m),
+        "polar_angular_sample_deg": float(angular_sample_deg),
+        "source_cell_count": source_cell_count,
+        "response_model": "polar_sinc_squared_power",
     }
     debug_maps = {
         "seed_mask": seed_mask.astype(np.float32),
@@ -746,6 +746,8 @@ def _build_radar_glints(
         "outside_attenuation": outside_attenuation.astype(np.float32),
         "background_noise_w": background_noise_w.astype(np.float32),
         "speckle_gain": speckle_gain.astype(np.float32),
+        "polar_source_power": polar_source.astype(np.float32),
+        "polar_response_power": polar_signal.astype(np.float32),
         "glint_power_w": glint_power_w.astype(np.float32),
     }
     return glint_map, glint_overlay, glint_power_w.astype(np.float32), report, debug_maps
@@ -886,10 +888,7 @@ def map_radar_equation_to_pixels(
         glint_map, glint_overlay, glint_power_w, glint_report, glint_debug = _build_radar_glints(
             rgb_image=rgb_image,
             candidate_mask=primary_cluster_region,
-            boundary_mask=(boundary_map[:, :, 0] > 0),
             primary_region=primary_cluster_region,
-            class_map=class_map,
-            class_names=class_names,
             geometry=geometry,
             base_received_power_w=raw_received_power_w,
             meters_per_pixel=meters_per_pixel,
@@ -897,6 +896,7 @@ def map_radar_equation_to_pixels(
             range_resolution_m=glint_range_resolution_m,
             spill_resolution_elements=glint_spill_resolution_elements,
             peak_gain_db=glint_peak_gain_db,
+            receiver_floor_dbw=receiver_sensitivity_dbw,
             noise_seed=gaussian_noise_seed,
         )
     else:
@@ -913,8 +913,10 @@ def map_radar_equation_to_pixels(
             "median_cross_range_resolution_px": 0.0,
             "spill_resolution_elements": float(glint_spill_resolution_elements),
             "max_spill_px": 0.0,
-            "peak_gain_db": float(glint_peak_gain_db),
-            "background_noise_scale_w": 0.0,
+            "processing_gain_db": float(glint_peak_gain_db),
+            "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_sensitivity_dbw)).reshape(-1)[0]),
+            "source_cell_count": 0,
+            "response_model": "polar_sinc_squared_power",
         }
         glint_debug = {
             "seed_mask": np.zeros(class_map.shape, dtype=np.float32),
@@ -922,6 +924,7 @@ def map_radar_equation_to_pixels(
             "primary_region": primary_cluster_region.astype(np.float32),
             "outside_attenuation": np.ones(class_map.shape, dtype=np.float32),
             "background_noise_w": np.zeros(class_map.shape, dtype=np.float32),
+            "speckle_gain": np.ones(class_map.shape, dtype=np.float32),
             "glint_power_w": glint_power_w.astype(np.float32),
         }
     heatmap = _render_grayscale(

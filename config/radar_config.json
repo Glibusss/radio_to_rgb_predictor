@@ -16,7 +16,7 @@
   "gaussian_noise_std_dbw": 1,
   "gaussian_noise_seed": 42,
   "glint_angular_resolution_deg": 1.0,
-  "glint_range_resolution_m": 15.0,
+  "glint_range_resolution_m": 1.5,
   "glint_spill_resolution_elements": 2.5,
   "glint_peak_gain_db": 9.0
 }
