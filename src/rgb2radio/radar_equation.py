@@ -118,6 +118,34 @@ def _geometry(
     }
 
 
+def _apply_boundary_scatter_cleanup(
+    pixel_rcs_map_m2: np.ndarray,
+    support_region: np.ndarray,
+) -> tuple[np.ndarray, Dict[str, object]]:
+    effective_rcs_map_m2 = pixel_rcs_map_m2.astype(np.float32).copy()
+    support_mask = support_region.astype(bool)
+    outside_mask = ~support_mask
+    outside_values = effective_rcs_map_m2[outside_mask]
+    positive_outside_values = outside_values[np.isfinite(outside_values) & (outside_values > 0.0)]
+    if positive_outside_values.size > 0:
+        background_rcs_m2 = float(np.median(positive_outside_values))
+    else:
+        all_values = effective_rcs_map_m2[np.isfinite(effective_rcs_map_m2) & (effective_rcs_map_m2 > 0.0)]
+        background_rcs_m2 = float(np.median(all_values)) if all_values.size > 0 else 0.0
+
+    replaced_pixel_count = int(np.count_nonzero(outside_mask))
+    if replaced_pixel_count > 0:
+        effective_rcs_map_m2[outside_mask] = background_rcs_m2
+
+    cleanup_report: Dict[str, object] = {
+        "applied": bool(replaced_pixel_count > 0),
+        "background_rcs_m2": background_rcs_m2,
+        "replaced_pixel_count": replaced_pixel_count,
+        "preserved_pixel_count": int(np.count_nonzero(support_mask)),
+    }
+    return effective_rcs_map_m2, cleanup_report
+
+
 def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float) -> np.ndarray:
     finite = np.isfinite(values_dbw)
     if not np.any(finite):
@@ -129,6 +157,144 @@ def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
+def _keep_central_boundary_cluster(
+    boundary_mask: np.ndarray,
+    origin_px: tuple[float, float],
+    center_radius_px: float,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+    binary_mask = boundary_mask.astype(np.uint8)
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+    if component_count <= 1:
+        cluster_report: Dict[str, object] = {
+            "component_count": 0,
+            "center_radius_px": float(center_radius_px),
+            "selection_mode": "empty",
+            "selected_component": None,
+            "kept_pixel_count": 0,
+        }
+        return boundary_mask.astype(bool), np.zeros_like(boundary_mask, dtype=bool), cluster_report
+
+    components = []
+    for label in range(1, component_count):
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px <= 0:
+            continue
+        centroid_x = float(centroids[label][0])
+        centroid_y = float(centroids[label][1])
+        centroid_distance_px = float(np.hypot(centroid_x - origin_px[0], centroid_y - origin_px[1]))
+        components.append(
+            {
+                "label": int(label),
+                "area_px": area_px,
+                "centroid_px": [centroid_x, centroid_y],
+                "centroid_distance_px": centroid_distance_px,
+            }
+        )
+
+    if not components:
+        cluster_report = {
+            "component_count": 0,
+            "center_radius_px": float(center_radius_px),
+            "selection_mode": "empty",
+            "selected_component": None,
+            "kept_pixel_count": 0,
+        }
+        return np.zeros_like(boundary_mask, dtype=bool), np.zeros_like(boundary_mask, dtype=bool), cluster_report
+
+    central_candidates = [
+        component for component in components if component["centroid_distance_px"] <= float(center_radius_px)
+    ]
+    if central_candidates:
+        selected_component = max(
+            central_candidates,
+            key=lambda component: (component["area_px"], -component["centroid_distance_px"]),
+        )
+        selection_mode = "largest_within_center_radius"
+    else:
+        selected_component = max(
+            components,
+            key=lambda component: (
+                component["area_px"] / max(component["centroid_distance_px"], 1.0),
+                component["area_px"],
+            ),
+        )
+        selection_mode = "best_area_distance_score"
+
+    selected_label = int(selected_component["label"])
+    primary_mask = labels == selected_label
+    sealed_primary_mask = (
+        cv2.morphologyEx(primary_mask.astype(np.uint8), cv2.MORPH_CLOSE, _kernel(5), iterations=1) > 0
+    )
+    free_space = (~sealed_primary_mask).astype(np.uint8)
+    background_count, background_labels = cv2.connectedComponents(free_space, connectivity=8)
+    if background_count > 0:
+        border_labels = np.unique(
+            np.concatenate(
+                [
+                    background_labels[0, :],
+                    background_labels[-1, :],
+                    background_labels[:, 0],
+                    background_labels[:, -1],
+                ]
+            )
+        )
+        enclosed_region = free_space.astype(bool) & ~np.isin(background_labels, border_labels)
+    else:
+        enclosed_region = np.zeros_like(boundary_mask, dtype=bool)
+
+    yy, xx = np.nonzero(primary_mask)
+    if xx.size >= 3:
+        hull_points = cv2.convexHull(np.stack([xx, yy], axis=1).astype(np.int32))
+        support_region = np.zeros_like(boundary_mask, dtype=np.uint8)
+        cv2.fillConvexPoly(support_region, hull_points, 1)
+        support_region = cv2.dilate(support_region, _kernel(9), iterations=1) > 0
+    else:
+        support_region = sealed_primary_mask.copy()
+
+    height, width = boundary_mask.shape
+    kept_labels = {selected_label}
+    retained_inner_components = []
+    for component in components:
+        label = int(component["label"])
+        if label == selected_label:
+            continue
+        component_mask = labels == label
+        overlap_inside_px = int(np.count_nonzero(component_mask & enclosed_region))
+        centroid_x, centroid_y = component["centroid_px"]
+        cx = int(np.clip(round(centroid_x), 0, width - 1))
+        cy = int(np.clip(round(centroid_y), 0, height - 1))
+        centroid_in_support = bool(support_region[cy, cx])
+        support_overlap_px = int(np.count_nonzero(component_mask & support_region))
+        support_overlap_ratio = float(support_overlap_px / max(int(component["area_px"]), 1))
+        if overlap_inside_px <= 0 and not centroid_in_support and support_overlap_ratio < 0.5:
+            continue
+        kept_labels.add(label)
+        retained_component = dict(component)
+        retained_component["overlap_inside_px"] = overlap_inside_px
+        retained_component["support_overlap_px"] = support_overlap_px
+        retained_component["support_overlap_ratio"] = support_overlap_ratio
+        retained_component["centroid_in_support"] = centroid_in_support
+        retained_inner_components.append(retained_component)
+
+    kept_mask = np.isin(labels, np.array(sorted(kept_labels), dtype=np.int32))
+    top_components = sorted(components, key=lambda component: component["area_px"], reverse=True)[:5]
+    cluster_report = {
+        "component_count": len(components),
+        "center_radius_px": float(center_radius_px),
+        "selection_mode": selection_mode,
+        "selected_component": selected_component,
+        "enclosed_region_pixel_count": int(enclosed_region.sum()),
+        "support_region_pixel_count": int(support_region.sum()),
+        "kept_component_count": int(len(kept_labels)),
+        "kept_inner_component_count": int(len(retained_inner_components)),
+        "kept_component_labels": [int(label) for label in sorted(kept_labels)],
+        "retained_inner_components": retained_inner_components,
+        "kept_pixel_count": int(kept_mask.sum()),
+        "top_components": top_components,
+    }
+    return kept_mask.astype(bool), support_region.astype(bool), cluster_report
+
+
 def _build_radar_boundaries(
     rgb_image: np.ndarray,
     class_map: np.ndarray,
@@ -136,7 +302,8 @@ def _build_radar_boundaries(
     origin_px: tuple[float, float],
     boundary_classes: Sequence[str],
     thickness_px: int,
-) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[str, int]]]:
+    center_radius_px: float,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[str, int]], Dict[str, object], np.ndarray]:
     height, width = class_map.shape
     class_index = {name: idx for idx, name in enumerate(class_names)}
     all_boundaries = np.zeros((height, width), dtype=bool)
@@ -162,12 +329,23 @@ def _build_radar_boundaries(
         per_class_maps[class_name] = full_boundary.astype(np.float32)
         report[class_name] = {"pixel_count": int(full_boundary.sum())}
 
+    filtered_boundaries, support_region, cluster_report = _keep_central_boundary_cluster(
+        boundary_mask=all_boundaries,
+        origin_px=origin_px,
+        center_radius_px=center_radius_px,
+    )
+    all_boundaries = filtered_boundaries
+    for class_name, class_boundary in per_class_maps.items():
+        filtered_class_boundary = class_boundary.astype(bool) & all_boundaries
+        per_class_maps[class_name] = filtered_class_boundary.astype(np.float32)
+        report[class_name] = {"pixel_count": int(filtered_class_boundary.sum())}
+
     boundary_map = np.zeros((height, width, 3), dtype=np.uint8)
     boundary_map[all_boundaries] = 255
     overlay = rgb_image.astype(np.float32).copy()
     overlay[all_boundaries] = 0.25 * overlay[all_boundaries] + 0.75 * 255.0
     boundary_overlay = overlay.clip(0, 255).astype(np.uint8)
-    return boundary_map, boundary_overlay, per_class_maps, report
+    return boundary_map, boundary_overlay, per_class_maps, report, cluster_report, support_region.astype(bool)
 
 
 def map_radar_equation_to_pixels(
@@ -198,6 +376,7 @@ def map_radar_equation_to_pixels(
     else:
         boundary_classes = ["forest", "building", "shrub"]
     boundary_thickness_px = int(config.get("boundary_thickness_px", 2))
+    boundary_cluster_center_radius_px = float(config.get("boundary_cluster_center_radius_px", 0.35 * min(rgb_image.shape[:2])))
 
     origin_px = _resolve_radar_origin(
         config=config,
@@ -205,6 +384,52 @@ def map_radar_equation_to_pixels(
         probabilities=probabilities,
         class_names=class_names,
     )
+    class_map = np.argmax(probabilities, axis=0).astype(np.uint8)
+    if use_radar_boundaries:
+        (
+            boundary_map,
+            boundary_overlay,
+            per_class_boundaries,
+            boundary_report,
+            boundary_cluster_report,
+            boundary_support_region,
+        ) = _build_radar_boundaries(
+            rgb_image=rgb_image,
+            class_map=class_map,
+            class_names=class_names,
+            origin_px=origin_px,
+            boundary_classes=boundary_classes,
+            thickness_px=boundary_thickness_px,
+            center_radius_px=boundary_cluster_center_radius_px,
+        )
+    else:
+        boundary_map = np.zeros_like(rgb_image)
+        boundary_overlay = rgb_image.copy()
+        per_class_boundaries = {class_name: np.zeros(class_map.shape, dtype=np.float32) for class_name in boundary_classes}
+        boundary_report = {class_name: {"pixel_count": 0} for class_name in boundary_classes}
+        boundary_cluster_report = {
+            "component_count": 0,
+            "center_radius_px": float(boundary_cluster_center_radius_px),
+            "selection_mode": "disabled",
+            "selected_component": None,
+            "kept_pixel_count": 0,
+        }
+        boundary_support_region = np.zeros(class_map.shape, dtype=bool)
+
+    if use_radar_boundaries and np.any(boundary_support_region):
+        effective_rcs_map_m2, boundary_scatter_cleanup_report = _apply_boundary_scatter_cleanup(
+            pixel_rcs_map_m2=pixel_rcs_map_m2,
+            support_region=boundary_support_region,
+        )
+    else:
+        effective_rcs_map_m2 = pixel_rcs_map_m2.astype(np.float32).copy()
+        boundary_scatter_cleanup_report = {
+            "applied": False,
+            "background_rcs_m2": None,
+            "replaced_pixel_count": 0,
+            "preserved_pixel_count": int(np.count_nonzero(boundary_support_region)),
+        }
+
     geometry = _geometry(
         shape=rgb_image.shape[:2],
         origin_px=origin_px,
@@ -226,7 +451,7 @@ def map_radar_equation_to_pixels(
     )
     received_power_w = (
         radar_constant
-        * np.maximum(pixel_rcs_map_m2.astype(np.float32), 0.0)
+        * np.maximum(effective_rcs_map_m2, 0.0)
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
     ).astype(np.float32)
     received_power_dbw = _linear_to_db(received_power_w)
@@ -238,21 +463,6 @@ def map_radar_equation_to_pixels(
     overlay = (
         rgb_image.astype(np.float32) * 0.56 + heatmap.astype(np.float32) * 0.44
     ).clip(0, 255).astype(np.uint8)
-    class_map = np.argmax(probabilities, axis=0).astype(np.uint8)
-    if use_radar_boundaries:
-        boundary_map, boundary_overlay, per_class_boundaries, boundary_report = _build_radar_boundaries(
-            rgb_image=rgb_image,
-            class_map=class_map,
-            class_names=class_names,
-            origin_px=origin_px,
-            boundary_classes=boundary_classes,
-            thickness_px=boundary_thickness_px,
-        )
-    else:
-        boundary_map = np.zeros_like(heatmap)
-        boundary_overlay = rgb_image.copy()
-        per_class_boundaries = {class_name: np.zeros(class_map.shape, dtype=np.float32) for class_name in boundary_classes}
-        boundary_report = {class_name: {"pixel_count": 0} for class_name in boundary_classes}
 
     summary = {
         "min_received_power_dbw": float(received_power_dbw.min()),
@@ -270,6 +480,8 @@ def map_radar_equation_to_pixels(
         "equation": "Pr = Pt * Gt * Gr * lambda^2 * sigma / ((4*pi)^3 * R^4 * L)",
         "summary": summary,
         "boundary_report": boundary_report,
+        "boundary_cluster_report": boundary_cluster_report,
+        "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
         "config": {
             "origin_mode": str(config.get("origin_mode", "image_center")),
             "frequency_ghz": frequency_ghz,
@@ -281,6 +493,7 @@ def map_radar_equation_to_pixels(
             "meters_per_pixel": meters_per_pixel,
             "boundary_classes": boundary_classes,
             "boundary_thickness_px": boundary_thickness_px,
+            "boundary_cluster_center_radius_px": boundary_cluster_center_radius_px,
             "receiver_sensitivity_dbw": receiver_sensitivity_dbw,
             "receiver_max_level_dbw": receiver_max_level_dbw,
         },
@@ -289,11 +502,14 @@ def map_radar_equation_to_pixels(
     debug_maps: Dict[str, np.ndarray] = {
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
         "radar_ground_offset_m": geometry["ground_offset_m"].astype(np.float32),
+        "radar_effective_rcs_map_m2": effective_rcs_map_m2.astype(np.float32),
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
         "radar_boundary_map_rgb": boundary_map,
         "radar_boundary_overlay_rgb": boundary_overlay,
+        "radar_boundary_cluster_mask": (boundary_map[:, :, 0] > 0).astype(np.float32),
+        "radar_boundary_support_region": boundary_support_region.astype(np.float32),
     }
     for class_name, boundary_values in per_class_boundaries.items():
         debug_maps[f"radar_boundary_{class_name}"] = boundary_values.astype(np.float32)

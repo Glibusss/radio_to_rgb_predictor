@@ -13,6 +13,7 @@
     "shrub"
   ],
   "boundary_thickness_px": 2,
+  "boundary_cluster_center_radius_px": 230.0,
   "receiver_sensitivity_dbw": -130.0,
   "receiver_max_level_dbw": -80.0
 }
