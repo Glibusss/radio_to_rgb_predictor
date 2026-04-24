@@ -1,0 +1,12 @@
+{
+  "train_if_missing_checkpoint": true,
+  "use_model_inference": true,
+  "use_shadow_refinement": true,
+  "use_vehicle_refinement": true,
+  "use_probability_smoothing": true,
+  "use_component_cleanup": true,
+  "use_rcs_mapping": true,
+  "use_brightness_normalization": true,
+  "use_shadow_rcs_nearest_majority": true,
+  "use_vehicle_rcs_distribution": true
+}

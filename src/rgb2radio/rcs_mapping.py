@@ -104,6 +104,7 @@ def _vehicle_component_map(
     min_db: float,
     max_db: float,
     distribution_bias: float,
+    use_distribution: bool,
 ) -> tuple[np.ndarray, list[Dict[str, float]]]:
     component_map = np.zeros_like(normalized_brightness, dtype=np.float32)
     reports: list[Dict[str, float]] = []
@@ -116,7 +117,10 @@ def _vehicle_component_map(
         component_score = float(component_values.mean()) if component_values.size else 0.5
         target_dbsm = float(min_db + component_score * (max_db - min_db))
         target_linear = float(_db_to_linear(target_dbsm))
-        weights = distribution_bias + component_values
+        if use_distribution:
+            weights = distribution_bias + component_values
+        else:
+            weights = np.ones_like(component_values, dtype=np.float32)
         weight_sum = float(weights.sum())
         if weight_sum <= 0.0:
             weights = np.ones_like(component_values, dtype=np.float32)
@@ -146,7 +150,8 @@ def _render_heatmap(values_dbsm: np.ndarray) -> np.ndarray:
         upper = lower + 1e-6
     scaled = ((values_dbsm - lower) / (upper - lower)).clip(0.0, 1.0)
     gray = (scaled * 255.0).astype(np.uint8)
-    return np.repeat(gray[:, :, None], 3, axis=2)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return np.repeat(binary[:, :, None], 3, axis=2)
 
 
 def _shadow_indices(class_names: Sequence[str]) -> list[int]:
@@ -222,17 +227,50 @@ def _nearest_majority_shadow_fill(
     return filled_linear_map, donor_class_map, donor_radius_map
 
 
+def _global_shadow_fill(
+    shadow_mask: np.ndarray,
+    class_map: np.ndarray,
+    direct_linear_map: np.ndarray,
+    class_names: Sequence[str],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    shadow_indices = _shadow_indices(class_names)
+    non_shadow_mask = ~np.isin(class_map, shadow_indices)
+    donor_class_map = np.full(class_map.shape, -1, dtype=np.int16)
+    donor_radius_map = np.zeros(class_map.shape, dtype=np.float32)
+    filled_linear_map = np.zeros_like(direct_linear_map, dtype=np.float32)
+
+    if not np.any(shadow_mask) or not np.any(non_shadow_mask):
+        return filled_linear_map, donor_class_map, donor_radius_map
+
+    global_counts = np.bincount(class_map[non_shadow_mask].ravel(), minlength=len(class_names))
+    for shadow_index in shadow_indices:
+        global_counts[shadow_index] = 0
+    donor_class = int(np.argmax(global_counts))
+    donor_values = direct_linear_map[(class_map == donor_class) & non_shadow_mask]
+    donor_value = float(donor_values.mean()) if donor_values.size else float(np.mean(direct_linear_map[non_shadow_mask]))
+
+    filled_linear_map[shadow_mask] = donor_value
+    donor_class_map[shadow_mask] = donor_class
+    donor_radius_map[shadow_mask] = -1.0
+    return filled_linear_map, donor_class_map, donor_radius_map
+
+
 def map_rcs_to_pixels(
     rgb_image: np.ndarray,
     class_map: np.ndarray,
     class_names: Sequence[str],
     config_path: str | Path,
+    pipeline_switches: Mapping[str, bool] | None = None,
 ) -> RcsMappingResult:
     config = _load_rcs_config(config_path)
     _validate_rcs_config(config, class_names)
+    switches = dict(pipeline_switches or {})
     pixel_area_m2 = PIXEL_AREA_M2
     low_percentile = _LOW_PERCENTILE
     high_percentile = _HIGH_PERCENTILE
+    use_brightness_normalization = bool(switches.get("use_brightness_normalization", True))
+    use_shadow_rcs_nearest_majority = bool(switches.get("use_shadow_rcs_nearest_majority", True))
+    use_vehicle_rcs_distribution = bool(switches.get("use_vehicle_rcs_distribution", True))
 
     brightness = _value_brightness(rgb_image)
     normalized_brightness, brightness_stats = _classwise_normalize(
@@ -242,6 +280,8 @@ def map_rcs_to_pixels(
         low_percentile=low_percentile,
         high_percentile=high_percentile,
     )
+    if not use_brightness_normalization:
+        normalized_brightness = np.full_like(normalized_brightness, 0.5, dtype=np.float32)
 
     linear_map_m2 = np.zeros_like(brightness, dtype=np.float32)
     sigma0_db_map = np.full_like(brightness, np.nan, dtype=np.float32)
@@ -270,6 +310,7 @@ def map_rcs_to_pixels(
                 min_db=min_db,
                 max_db=max_db,
                 distribution_bias=_VEHICLE_DISTRIBUTION_BIAS,
+                use_distribution=use_vehicle_rcs_distribution,
             )
             linear_map_m2[mask] = component_map[mask]
             sigma0_db_map[mask] = np.nan
@@ -307,12 +348,20 @@ def map_rcs_to_pixels(
     non_shadow_mask = ~np.isin(class_map, shadow_indices)
     if np.any(non_shadow_mask):
         shadow_mask = ~non_shadow_mask
-        filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _nearest_majority_shadow_fill(
-            shadow_mask=shadow_mask,
-            class_map=class_map,
-            direct_linear_map=linear_map_m2,
-            class_names=class_names,
-        )
+        if use_shadow_rcs_nearest_majority:
+            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _nearest_majority_shadow_fill(
+                shadow_mask=shadow_mask,
+                class_map=class_map,
+                direct_linear_map=linear_map_m2,
+                class_names=class_names,
+            )
+        else:
+            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _global_shadow_fill(
+                shadow_mask=shadow_mask,
+                class_map=class_map,
+                direct_linear_map=linear_map_m2,
+                class_names=class_names,
+            )
         linear_map_m2[shadow_mask] = filled_shadow_linear[shadow_mask]
         sigma0_db_map[shadow_mask] = _linear_to_db(linear_map_m2[shadow_mask]) - surface_area_offset_db
 
@@ -366,8 +415,10 @@ def map_rcs_to_pixels(
             "metric": "hsv_value",
             "low_percentile": low_percentile,
             "high_percentile": high_percentile,
+            "enabled": use_brightness_normalization,
         },
         "class_reports": class_reports,
+        "pipeline_switches": dict(switches),
         "notes": [
             "Distributed classes use brightness-normalized ranges from the config.",
             "Shadow pixels inherit EPR from the nearest ring of non-shadow classes using the most frequent class on that ring.",

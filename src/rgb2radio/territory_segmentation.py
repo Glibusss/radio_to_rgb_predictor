@@ -230,8 +230,16 @@ def segment_territories(
     patch_size: int = 64,
     stride: int = 24,
     seed: int = 42,
+    pipeline_switches: Mapping[str, bool] | None = None,
 ) -> TerritorySegmentationResult:
     model_path = Path(model_path)
+    switches = dict(pipeline_switches or {})
+    allow_training = bool(switches.get("train_if_missing_checkpoint", True))
+    use_model_inference = bool(switches.get("use_model_inference", True))
+    use_shadow_refinement = bool(switches.get("use_shadow_refinement", True))
+    use_vehicle_refinement = bool(switches.get("use_vehicle_refinement", True))
+    use_probability_smoothing = bool(switches.get("use_probability_smoothing", True))
+    use_component_cleanup = bool(switches.get("use_component_cleanup", True))
     training_summary: Dict[str, object] = {
         "model_path": str(model_path),
         "trained": False,
@@ -239,7 +247,7 @@ def segment_territories(
         "fallback_mode": "heuristic_only",
     }
 
-    if retrain or not model_path.exists():
+    if (retrain or not model_path.exists()) and allow_training:
         try:
             training = train_terrain_resnet(
                 rgb_image=rgb_image,
@@ -261,16 +269,20 @@ def segment_territories(
             }
         except RuntimeError as exc:
             training_summary["error"] = str(exc)
+    elif retrain or not model_path.exists():
+        training_summary["training_disabled_by_config"] = True
 
     score_maps = build_heuristic_score_maps(rgb_image)
     model_probabilities = None
     checkpoint_metadata: Mapping[str, object] | None = None
-    if model_path.exists():
+    if use_model_inference and model_path.exists():
         model_probabilities = predict_terrain_probabilities(rgb_image, model_path, stride=stride)
         checkpoint_metadata = load_checkpoint_metadata(model_path)
         training_summary["fallback_mode"] = "terrain_resnet"
         if not bool(training_summary.get("trained")):
             training_summary["reused_checkpoint"] = True
+    elif not use_model_inference:
+        training_summary["model_inference_disabled_by_config"] = True
 
     base_probabilities = combine_terrain_probabilities(
         score_maps=score_maps,
@@ -314,39 +326,48 @@ def segment_territories(
     )
 
     shadow_candidate = scene["shadow_candidate"]
-    forest_shadow = normalize01(
-        shadow_candidate
-        * (0.30 + 0.70 * forest_proximity)
-        * (1.0 - 0.38 * building_proximity)
-        * (1.0 - 0.22 * water_core.astype(np.float32))
-        * (1.0 - 0.28 * base_forest)
-    )
-    building_shadow = normalize01(
-        shadow_candidate
-        * (0.32 + 0.68 * building_proximity)
-        * (0.25 + 0.75 * near_manmade)
-        * (0.35 + 0.65 * score_maps["hard_edges"])
-        * (1.0 - 0.25 * base_building)
-        * (1.0 - 0.20 * base_water)
-    )
+    if use_shadow_refinement:
+        forest_shadow = normalize01(
+            shadow_candidate
+            * (0.30 + 0.70 * forest_proximity)
+            * (1.0 - 0.38 * building_proximity)
+            * (1.0 - 0.22 * water_core.astype(np.float32))
+            * (1.0 - 0.28 * base_forest)
+        )
+        building_shadow = normalize01(
+            shadow_candidate
+            * (0.32 + 0.68 * building_proximity)
+            * (0.25 + 0.75 * near_manmade)
+            * (0.35 + 0.65 * score_maps["hard_edges"])
+            * (1.0 - 0.25 * base_building)
+            * (1.0 - 0.20 * base_water)
+        )
+    else:
+        forest_shadow = np.zeros_like(base_forest, dtype=np.float32)
+        building_shadow = np.zeros_like(base_forest, dtype=np.float32)
 
-    vehicle_response = normalize01(
-        np.maximum(scene["small_bright"], 0.9 * scene["small_dark"])
-        * (0.28 + 0.72 * scene["local_contrast"])
-        * (0.38 + 0.62 * score_maps["corners"])
-        * (0.42 + 0.58 * score_maps["hard_edges"])
-        * (0.30 + 0.70 * near_manmade)
-        * (1.0 - 0.70 * base_forest)
-        * (1.0 - 0.55 * base_water)
-    )
-    vehicle_mask = _extract_vehicle_mask(
-        vehicle_response=vehicle_response,
-        near_manmade=near_manmade,
-        road_mask=road_core,
-        building_mask=building_core,
-    )
-    vehicle = cv2.GaussianBlur(vehicle_mask.astype(np.float32), (0, 0), sigmaX=0.8, sigmaY=0.8)
-    vehicle = np.maximum(vehicle, 0.65 * vehicle_response)
+    if use_vehicle_refinement:
+        vehicle_response = normalize01(
+            np.maximum(scene["small_bright"], 0.9 * scene["small_dark"])
+            * (0.28 + 0.72 * scene["local_contrast"])
+            * (0.38 + 0.62 * score_maps["corners"])
+            * (0.42 + 0.58 * score_maps["hard_edges"])
+            * (0.30 + 0.70 * near_manmade)
+            * (1.0 - 0.70 * base_forest)
+            * (1.0 - 0.55 * base_water)
+        )
+        vehicle_mask = _extract_vehicle_mask(
+            vehicle_response=vehicle_response,
+            near_manmade=near_manmade,
+            road_mask=road_core,
+            building_mask=building_core,
+        )
+        vehicle = cv2.GaussianBlur(vehicle_mask.astype(np.float32), (0, 0), sigmaX=0.8, sigmaY=0.8)
+        vehicle = np.maximum(vehicle, 0.65 * vehicle_response)
+    else:
+        vehicle_response = np.zeros_like(base_forest, dtype=np.float32)
+        vehicle_mask = np.zeros_like(base_forest, dtype=bool)
+        vehicle = np.zeros_like(base_forest, dtype=np.float32)
 
     forest = normalize01(
         (0.82 * base_forest + 0.18 * score_maps["forest_group"])
@@ -404,30 +425,36 @@ def segment_territories(
     if np.any(water_core):
         water_support = _proximity_map(water_core, sigma=5.0, dilate_size=7)
         probabilities[4] *= 0.58 + 0.42 * water_support
-    probabilities[5] *= 0.18 + 0.82 * (forest_shadow > 0.18).astype(np.float32)
-    probabilities[6] *= 0.18 + 0.82 * (building_shadow > 0.18).astype(np.float32)
+    if use_shadow_refinement:
+        probabilities[5] *= 0.18 + 0.82 * (forest_shadow > 0.18).astype(np.float32)
+        probabilities[6] *= 0.18 + 0.82 * (building_shadow > 0.18).astype(np.float32)
     probabilities[7] *= 0.22 + 0.78 * (shrub > 0.16).astype(np.float32)
-    probabilities[8] *= 0.12 + 0.88 * (vehicle > 0.20).astype(np.float32)
+    if use_vehicle_refinement:
+        probabilities[8] *= 0.12 + 0.88 * (vehicle > 0.20).astype(np.float32)
     probabilities = normalize_probabilities(np.maximum(probabilities, 1e-7))
 
-    smoothed = np.stack(
-        [
-            cv2.GaussianBlur(probabilities[index], (0, 0), sigmaX=1.0, sigmaY=1.0)
-            for index in range(probabilities.shape[0])
-        ],
-        axis=0,
-    ).astype(np.float32)
-    probabilities = normalize_probabilities(0.76 * probabilities + 0.24 * smoothed)
-    probabilities = _cleanup_probabilities(probabilities)
-    probabilities[8] = np.maximum(probabilities[8], vehicle.astype(np.float32))
+    if use_probability_smoothing:
+        smoothed = np.stack(
+            [
+                cv2.GaussianBlur(probabilities[index], (0, 0), sigmaX=1.0, sigmaY=1.0)
+                for index in range(probabilities.shape[0])
+            ],
+            axis=0,
+        ).astype(np.float32)
+        probabilities = normalize_probabilities(0.76 * probabilities + 0.24 * smoothed)
+    if use_component_cleanup:
+        probabilities = _cleanup_probabilities(probabilities)
+    if use_vehicle_refinement:
+        probabilities[8] = np.maximum(probabilities[8], vehicle.astype(np.float32))
     probabilities = normalize_probabilities(probabilities)
 
     class_map = np.argmax(probabilities, axis=0).astype(np.uint8)
-    class_map[vehicle_mask] = np.uint8(TERRITORY_CLASS_NAMES.index("vehicle"))
-    if np.any(building_shadow > 0.45):
+    if use_vehicle_refinement:
+        class_map[vehicle_mask] = np.uint8(TERRITORY_CLASS_NAMES.index("vehicle"))
+    if use_shadow_refinement and np.any(building_shadow > 0.45):
         building_shadow_mask = (building_shadow > 0.45) & ~vehicle_mask & ~building_core & ~water_core
         class_map[building_shadow_mask] = np.uint8(TERRITORY_CLASS_NAMES.index("building_shadow"))
-    if np.any(forest_shadow > 0.46):
+    if use_shadow_refinement and np.any(forest_shadow > 0.46):
         forest_shadow_mask = (forest_shadow > 0.46) & ~vehicle_mask & ~water_core & ~building_core
         class_map[forest_shadow_mask] = np.uint8(TERRITORY_CLASS_NAMES.index("forest_shadow"))
 
@@ -467,6 +494,7 @@ def segment_territories(
         "class_distribution": _class_distribution(class_map),
         "training_summary": dict(training_summary),
         "model_path": str(model_path),
+        "pipeline_switches": dict(switches),
     }
 
     return TerritorySegmentationResult(
