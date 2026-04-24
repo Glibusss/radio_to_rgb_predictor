@@ -90,16 +90,13 @@ def _geometry(
     }
 
 
-def _render_grayscale(values_dbw: np.ndarray) -> np.ndarray:
+def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float) -> np.ndarray:
     finite = np.isfinite(values_dbw)
     if not np.any(finite):
         return np.zeros(values_dbw.shape + (3,), dtype=np.uint8)
-    samples = values_dbw[finite]
-    lower = float(np.percentile(samples, 2.0))
-    upper = float(np.percentile(samples, 98.0))
-    if upper - lower < 1e-6:
-        upper = lower + 1e-6
-    scaled = ((values_dbw - lower) / (upper - lower)).clip(0.0, 1.0)
+    if upper_dbw - lower_dbw < 1e-6:
+        upper_dbw = lower_dbw + 1e-6
+    scaled = ((values_dbw - lower_dbw) / (upper_dbw - lower_dbw)).clip(0.0, 1.0)
     gray = (scaled * 255.0).astype(np.uint8)
     return np.repeat(gray[:, :, None], 3, axis=2)
 
@@ -119,6 +116,10 @@ def map_radar_equation_to_pixels(
     antenna_height_m = _require_float(config, "antenna_height_m")
     reference_range_m = _require_float(config, "reference_range_m")
     meters_per_pixel = _require_float(config, "meters_per_pixel")
+    receiver_sensitivity_dbw = _require_float(config, "receiver_sensitivity_dbw")
+    receiver_max_level_dbw = _require_float(config, "receiver_max_level_dbw")
+    if receiver_max_level_dbw <= receiver_sensitivity_dbw:
+        raise ValueError("receiver_max_level_dbw must be greater than receiver_sensitivity_dbw.")
 
     origin_px = _estimate_radar_origin(probabilities=probabilities, class_names=class_names)
     geometry = _geometry(
@@ -146,7 +147,11 @@ def map_radar_equation_to_pixels(
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
     ).astype(np.float32)
     received_power_dbw = _linear_to_db(received_power_w)
-    heatmap = _render_grayscale(received_power_dbw)
+    heatmap = _render_grayscale(
+        values_dbw=received_power_dbw,
+        lower_dbw=receiver_sensitivity_dbw,
+        upper_dbw=receiver_max_level_dbw,
+    )
     overlay = (
         rgb_image.astype(np.float32) * 0.56 + heatmap.astype(np.float32) * 0.44
     ).clip(0, 255).astype(np.uint8)
@@ -160,6 +165,8 @@ def map_radar_equation_to_pixels(
         "radar_constant": float(radar_constant),
         "config_path": str(config["config_path"]),
         "origin_px": [float(origin_px[0]), float(origin_px[1])],
+        "visual_black_level_dbw": float(receiver_sensitivity_dbw),
+        "visual_white_level_dbw": float(receiver_max_level_dbw),
     }
     report: Dict[str, object] = {
         "equation": "Pr = Pt * Gt * Gr * lambda^2 * sigma / ((4*pi)^3 * R^4 * L)",
@@ -172,6 +179,8 @@ def map_radar_equation_to_pixels(
             "antenna_height_m": antenna_height_m,
             "reference_range_m": reference_range_m,
             "meters_per_pixel": meters_per_pixel,
+            "receiver_sensitivity_dbw": receiver_sensitivity_dbw,
+            "receiver_max_level_dbw": receiver_max_level_dbw,
         },
     }
     debug_maps: Dict[str, np.ndarray] = {
