@@ -146,6 +146,36 @@ def _apply_boundary_scatter_cleanup(
     return effective_rcs_map_m2, cleanup_report
 
 
+def _apply_white_gaussian_noise(
+    values_dbw: np.ndarray,
+    mean_dbw: float,
+    std_dbw: float,
+    seed: int | None,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+    if std_dbw <= 0.0:
+        noise = np.zeros_like(values_dbw, dtype=np.float32)
+        report: Dict[str, object] = {
+            "applied": False,
+            "mean_dbw": float(mean_dbw),
+            "std_dbw": float(std_dbw),
+            "seed": None if seed is None else int(seed),
+        }
+        return values_dbw.astype(np.float32), noise, report
+
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(loc=mean_dbw, scale=std_dbw, size=values_dbw.shape).astype(np.float32)
+    noisy_values_dbw = (values_dbw.astype(np.float32) + noise).astype(np.float32)
+    report = {
+        "applied": True,
+        "mean_dbw": float(mean_dbw),
+        "std_dbw": float(std_dbw),
+        "seed": None if seed is None else int(seed),
+        "realized_mean_dbw": float(noise.mean()),
+        "realized_std_dbw": float(noise.std()),
+    }
+    return noisy_values_dbw, noise, report
+
+
 def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float) -> np.ndarray:
     finite = np.isfinite(values_dbw)
     if not np.any(finite):
@@ -367,6 +397,10 @@ def map_radar_equation_to_pixels(
     meters_per_pixel = _require_float(config, "meters_per_pixel")
     receiver_sensitivity_dbw = _require_float(config, "receiver_sensitivity_dbw")
     receiver_max_level_dbw = _require_float(config, "receiver_max_level_dbw")
+    gaussian_noise_mean_dbw = float(config.get("gaussian_noise_mean_dbw", 0.0))
+    gaussian_noise_std_dbw = float(config.get("gaussian_noise_std_dbw", 0.75))
+    raw_noise_seed = config.get("gaussian_noise_seed", 42)
+    gaussian_noise_seed = None if raw_noise_seed is None else int(raw_noise_seed)
     if receiver_max_level_dbw <= receiver_sensitivity_dbw:
         raise ValueError("receiver_max_level_dbw must be greater than receiver_sensitivity_dbw.")
     use_radar_boundaries = bool(switches.get("use_radar_boundaries", True))
@@ -454,7 +488,15 @@ def map_radar_equation_to_pixels(
         * np.maximum(effective_rcs_map_m2, 0.0)
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
     ).astype(np.float32)
-    received_power_dbw = _linear_to_db(received_power_w)
+    raw_received_power_w = received_power_w.copy()
+    raw_received_power_dbw = _linear_to_db(raw_received_power_w)
+    received_power_dbw, noise_dbw, gaussian_noise_report = _apply_white_gaussian_noise(
+        values_dbw=raw_received_power_dbw,
+        mean_dbw=gaussian_noise_mean_dbw,
+        std_dbw=gaussian_noise_std_dbw,
+        seed=gaussian_noise_seed,
+    )
+    received_power_w = _db_to_linear(received_power_dbw)
     heatmap = _render_grayscale(
         values_dbw=received_power_dbw,
         lower_dbw=receiver_sensitivity_dbw,
@@ -482,6 +524,7 @@ def map_radar_equation_to_pixels(
         "boundary_report": boundary_report,
         "boundary_cluster_report": boundary_cluster_report,
         "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
+        "gaussian_noise_report": gaussian_noise_report,
         "config": {
             "origin_mode": str(config.get("origin_mode", "image_center")),
             "frequency_ghz": frequency_ghz,
@@ -496,6 +539,9 @@ def map_radar_equation_to_pixels(
             "boundary_cluster_center_radius_px": boundary_cluster_center_radius_px,
             "receiver_sensitivity_dbw": receiver_sensitivity_dbw,
             "receiver_max_level_dbw": receiver_max_level_dbw,
+            "gaussian_noise_mean_dbw": gaussian_noise_mean_dbw,
+            "gaussian_noise_std_dbw": gaussian_noise_std_dbw,
+            "gaussian_noise_seed": gaussian_noise_seed,
         },
         "pipeline_switches": dict(switches),
     }
@@ -503,6 +549,8 @@ def map_radar_equation_to_pixels(
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
         "radar_ground_offset_m": geometry["ground_offset_m"].astype(np.float32),
         "radar_effective_rcs_map_m2": effective_rcs_map_m2.astype(np.float32),
+        "radar_received_power_dbw_raw": raw_received_power_dbw.astype(np.float32),
+        "radar_white_gaussian_noise_dbw": noise_dbw.astype(np.float32),
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
