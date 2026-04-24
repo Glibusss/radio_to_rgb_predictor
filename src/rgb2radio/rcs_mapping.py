@@ -98,6 +98,10 @@ def _resolve_reference_range_db(config: Mapping[str, object], class_name: str) -
     return float(spec["minimum"]), float(spec["maximum"])
 
 
+def _class_constant_db(min_db: float, max_db: float) -> float:
+    return 0.5 * (float(min_db) + float(max_db))
+
+
 def _vehicle_component_map(
     mask: np.ndarray,
     normalized_brightness: np.ndarray,
@@ -150,8 +154,7 @@ def _render_heatmap(values_dbsm: np.ndarray) -> np.ndarray:
         upper = lower + 1e-6
     scaled = ((values_dbsm - lower) / (upper - lower)).clip(0.0, 1.0)
     gray = (scaled * 255.0).astype(np.uint8)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return np.repeat(binary[:, :, None], 3, axis=2)
+    return np.repeat(gray[:, :, None], 3, axis=2)
 
 
 def _shadow_indices(class_names: Sequence[str]) -> list[int]:
@@ -302,31 +305,51 @@ def map_rcs_to_pixels(
 
         min_db, max_db = _resolve_reference_range_db(config, class_name)
         brightness_values = normalized_brightness[mask].astype(np.float32)
+        constant_db = _class_constant_db(min_db, max_db)
 
         if class_name == "vehicle":
-            component_map, component_reports = _vehicle_component_map(
-                mask=mask,
-                normalized_brightness=normalized_brightness,
-                min_db=min_db,
-                max_db=max_db,
-                distribution_bias=_VEHICLE_DISTRIBUTION_BIAS,
-                use_distribution=use_vehicle_rcs_distribution,
-            )
-            linear_map_m2[mask] = component_map[mask]
-            sigma0_db_map[mask] = np.nan
-            class_reports[class_name] = {
-                "pixel_count": int(mask.sum()),
-                "pixel_share": float(mask.mean()),
-                "reference_range_db": [min_db, max_db],
-                "brightness_stats": brightness_stats.get(class_name, {}),
-                "sum_rcs_m2": float(component_map[mask].sum()),
-                "mean_pixel_rcs_m2": float(component_map[mask].mean()),
-                "mean_pixel_rcs_dbsm": float(_linear_to_db(component_map[mask]).mean()),
-                "component_reports": component_reports,
-            }
+            if use_vehicle_rcs_distribution:
+                component_map, component_reports = _vehicle_component_map(
+                    mask=mask,
+                    normalized_brightness=normalized_brightness,
+                    min_db=min_db,
+                    max_db=max_db,
+                    distribution_bias=_VEHICLE_DISTRIBUTION_BIAS,
+                    use_distribution=use_vehicle_rcs_distribution,
+                )
+                linear_map_m2[mask] = component_map[mask]
+                sigma0_db_map[mask] = np.nan
+                class_reports[class_name] = {
+                    "pixel_count": int(mask.sum()),
+                    "pixel_share": float(mask.mean()),
+                    "reference_range_db": [min_db, max_db],
+                    "class_constant_db": constant_db,
+                    "brightness_stats": brightness_stats.get(class_name, {}),
+                    "sum_rcs_m2": float(component_map[mask].sum()),
+                    "mean_pixel_rcs_m2": float(component_map[mask].mean()),
+                    "mean_pixel_rcs_dbsm": float(_linear_to_db(component_map[mask]).mean()),
+                    "component_reports": component_reports,
+                }
+            else:
+                constant_linear = float(_db_to_linear(constant_db))
+                linear_map_m2[mask] = constant_linear
+                sigma0_db_map[mask] = np.nan
+                class_reports[class_name] = {
+                    "pixel_count": int(mask.sum()),
+                    "pixel_share": float(mask.mean()),
+                    "reference_range_db": [min_db, max_db],
+                    "class_constant_db": constant_db,
+                    "brightness_stats": brightness_stats.get(class_name, {}),
+                    "sum_rcs_m2": float(linear_map_m2[mask].sum()),
+                    "mean_pixel_rcs_m2": float(linear_map_m2[mask].mean()),
+                    "mean_pixel_rcs_dbsm": float(_linear_to_db(linear_map_m2[mask]).mean()),
+                }
             continue
 
-        sigma0_db = (min_db + brightness_values * (max_db - min_db)).astype(np.float32)
+        if use_brightness_normalization:
+            sigma0_db = (min_db + brightness_values * (max_db - min_db)).astype(np.float32)
+        else:
+            sigma0_db = np.full(mask.sum(), constant_db, dtype=np.float32)
         sigma0_db_map[mask] = sigma0_db
         per_pixel_dbsm = sigma0_db + surface_area_offset_db
         linear_map_m2[mask] = _db_to_linear(per_pixel_dbsm)
@@ -334,6 +357,7 @@ def map_rcs_to_pixels(
             "pixel_count": int(mask.sum()),
             "pixel_share": float(mask.mean()),
             "reference_range_db": [min_db, max_db],
+            "class_constant_db": constant_db,
             "effective_pixel_rcs_dbsm_range": [
                 float(min_db + surface_area_offset_db),
                 float(max_db + surface_area_offset_db),
@@ -420,9 +444,9 @@ def map_rcs_to_pixels(
         "class_reports": class_reports,
         "pipeline_switches": dict(switches),
         "notes": [
-            "Distributed classes use brightness-normalized ranges from the config.",
+            "When brightness normalization is disabled, each configured class uses one constant EPR value equal to the midpoint of its minimum and maximum range.",
             "Shadow pixels inherit EPR from the nearest ring of non-shadow classes using the most frequent class on that ring.",
-            "Vehicle keeps object-level EPR and distributes it across connected components."
+            "Vehicle can either use one constant class value or be distributed across connected components depending on the pipeline switches."
         ],
     }
 

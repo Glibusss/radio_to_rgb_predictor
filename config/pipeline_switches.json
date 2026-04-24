@@ -6,7 +6,7 @@
   "use_probability_smoothing": true,
   "use_component_cleanup": true,
   "use_rcs_mapping": true,
-  "use_brightness_normalization": true,
+  "use_brightness_normalization": false,
   "use_shadow_rcs_nearest_majority": true,
-  "use_vehicle_rcs_distribution": true
+  "use_vehicle_rcs_distribution": false
 }
