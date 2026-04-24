@@ -19,6 +19,8 @@ class RadarEquationResult:
     received_power_dbw: np.ndarray
     heatmap: np.ndarray
     overlay: np.ndarray
+    boundary_map: np.ndarray
+    boundary_overlay: np.ndarray
     debug_maps: Mapping[str, np.ndarray]
     report: Mapping[str, object]
     config: Mapping[str, object]
@@ -67,6 +69,32 @@ def _estimate_radar_origin(probabilities: np.ndarray, class_names: Sequence[str]
     return float((xx * weights).sum() / total), float((yy * weights).sum() / total)
 
 
+def _kernel(size: int) -> np.ndarray:
+    size = max(1, int(size))
+    if size % 2 == 0:
+        size += 1
+    return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+
+def _resolve_radar_origin(
+    config: Mapping[str, object],
+    shape: tuple[int, int],
+    probabilities: np.ndarray,
+    class_names: Sequence[str],
+) -> tuple[float, float]:
+    height, width = shape
+    origin_mode = str(config.get("origin_mode", "image_center")).lower()
+    if origin_mode == "image_center":
+        return width / 2.0, height / 2.0
+    if origin_mode == "auto_scene":
+        return _estimate_radar_origin(probabilities=probabilities, class_names=class_names)
+    if origin_mode == "fixed_px":
+        x = float(config.get("origin_x_px", width / 2.0))
+        y = float(config.get("origin_y_px", height / 2.0))
+        return x, y
+    raise ValueError(f"Unsupported radar origin_mode: {origin_mode}")
+
+
 def _geometry(
     shape: tuple[int, int],
     origin_px: tuple[float, float],
@@ -101,14 +129,57 @@ def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
+def _build_radar_boundaries(
+    rgb_image: np.ndarray,
+    class_map: np.ndarray,
+    class_names: Sequence[str],
+    origin_px: tuple[float, float],
+    boundary_classes: Sequence[str],
+    thickness_px: int,
+) -> tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, Dict[str, int]]]:
+    height, width = class_map.shape
+    class_index = {name: idx for idx, name in enumerate(class_names)}
+    all_boundaries = np.zeros((height, width), dtype=bool)
+    per_class_maps: Dict[str, np.ndarray] = {}
+    report: Dict[str, Dict[str, int]] = {}
+
+    for class_name in boundary_classes:
+        if class_name not in class_index:
+            continue
+        mask = class_map == class_index[class_name]
+        if not np.any(mask):
+            per_class_maps[class_name] = np.zeros((height, width), dtype=np.float32)
+            report[class_name] = {"pixel_count": 0}
+            continue
+
+        boundary_ring = mask & ~cv2.erode(mask.astype(np.uint8), _kernel(3), iterations=1).astype(bool)
+        full_boundary = boundary_ring
+
+        if thickness_px > 1 and np.any(full_boundary):
+            full_boundary = cv2.dilate(full_boundary.astype(np.uint8), _kernel(thickness_px), iterations=1) > 0
+
+        all_boundaries |= full_boundary
+        per_class_maps[class_name] = full_boundary.astype(np.float32)
+        report[class_name] = {"pixel_count": int(full_boundary.sum())}
+
+    boundary_map = np.zeros((height, width, 3), dtype=np.uint8)
+    boundary_map[all_boundaries] = 255
+    overlay = rgb_image.astype(np.float32).copy()
+    overlay[all_boundaries] = 0.25 * overlay[all_boundaries] + 0.75 * 255.0
+    boundary_overlay = overlay.clip(0, 255).astype(np.uint8)
+    return boundary_map, boundary_overlay, per_class_maps, report
+
+
 def map_radar_equation_to_pixels(
     rgb_image: np.ndarray,
     class_names: Sequence[str],
     probabilities: np.ndarray,
     pixel_rcs_map_m2: np.ndarray,
     config_path: str | Path,
+    pipeline_switches: Mapping[str, bool] | None = None,
 ) -> RadarEquationResult:
     config = _load_radar_config(config_path)
+    switches = dict(pipeline_switches or {})
     frequency_ghz = _require_float(config, "frequency_ghz")
     transmit_power_w = _require_float(config, "transmit_power_w")
     antenna_gain_db = _require_float(config, "antenna_gain_db")
@@ -120,8 +191,20 @@ def map_radar_equation_to_pixels(
     receiver_max_level_dbw = _require_float(config, "receiver_max_level_dbw")
     if receiver_max_level_dbw <= receiver_sensitivity_dbw:
         raise ValueError("receiver_max_level_dbw must be greater than receiver_sensitivity_dbw.")
+    use_radar_boundaries = bool(switches.get("use_radar_boundaries", True))
+    raw_boundary_classes = config.get("boundary_classes", ["forest", "building", "shrub"])
+    if isinstance(raw_boundary_classes, Sequence) and not isinstance(raw_boundary_classes, str):
+        boundary_classes = [str(value) for value in raw_boundary_classes]
+    else:
+        boundary_classes = ["forest", "building", "shrub"]
+    boundary_thickness_px = int(config.get("boundary_thickness_px", 2))
 
-    origin_px = _estimate_radar_origin(probabilities=probabilities, class_names=class_names)
+    origin_px = _resolve_radar_origin(
+        config=config,
+        shape=rgb_image.shape[:2],
+        probabilities=probabilities,
+        class_names=class_names,
+    )
     geometry = _geometry(
         shape=rgb_image.shape[:2],
         origin_px=origin_px,
@@ -155,6 +238,21 @@ def map_radar_equation_to_pixels(
     overlay = (
         rgb_image.astype(np.float32) * 0.56 + heatmap.astype(np.float32) * 0.44
     ).clip(0, 255).astype(np.uint8)
+    class_map = np.argmax(probabilities, axis=0).astype(np.uint8)
+    if use_radar_boundaries:
+        boundary_map, boundary_overlay, per_class_boundaries, boundary_report = _build_radar_boundaries(
+            rgb_image=rgb_image,
+            class_map=class_map,
+            class_names=class_names,
+            origin_px=origin_px,
+            boundary_classes=boundary_classes,
+            thickness_px=boundary_thickness_px,
+        )
+    else:
+        boundary_map = np.zeros_like(heatmap)
+        boundary_overlay = rgb_image.copy()
+        per_class_boundaries = {class_name: np.zeros(class_map.shape, dtype=np.float32) for class_name in boundary_classes}
+        boundary_report = {class_name: {"pixel_count": 0} for class_name in boundary_classes}
 
     summary = {
         "min_received_power_dbw": float(received_power_dbw.min()),
@@ -171,7 +269,9 @@ def map_radar_equation_to_pixels(
     report: Dict[str, object] = {
         "equation": "Pr = Pt * Gt * Gr * lambda^2 * sigma / ((4*pi)^3 * R^4 * L)",
         "summary": summary,
+        "boundary_report": boundary_report,
         "config": {
+            "origin_mode": str(config.get("origin_mode", "image_center")),
             "frequency_ghz": frequency_ghz,
             "transmit_power_w": transmit_power_w,
             "antenna_gain_db": antenna_gain_db,
@@ -179,9 +279,12 @@ def map_radar_equation_to_pixels(
             "antenna_height_m": antenna_height_m,
             "reference_range_m": reference_range_m,
             "meters_per_pixel": meters_per_pixel,
+            "boundary_classes": boundary_classes,
+            "boundary_thickness_px": boundary_thickness_px,
             "receiver_sensitivity_dbw": receiver_sensitivity_dbw,
             "receiver_max_level_dbw": receiver_max_level_dbw,
         },
+        "pipeline_switches": dict(switches),
     }
     debug_maps: Dict[str, np.ndarray] = {
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
@@ -189,13 +292,19 @@ def map_radar_equation_to_pixels(
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
+        "radar_boundary_map_rgb": boundary_map,
+        "radar_boundary_overlay_rgb": boundary_overlay,
     }
+    for class_name, boundary_values in per_class_boundaries.items():
+        debug_maps[f"radar_boundary_{class_name}"] = boundary_values.astype(np.float32)
 
     return RadarEquationResult(
         received_power_w=received_power_w,
         received_power_dbw=received_power_dbw,
         heatmap=heatmap,
         overlay=overlay,
+        boundary_map=boundary_map,
+        boundary_overlay=boundary_overlay,
         debug_maps=debug_maps,
         report=report,
         config=config,

@@ -1,4 +1,5 @@
 {
+  "origin_mode": "image_center",
   "frequency_ghz": 9.4,
   "transmit_power_w": 50.0,
   "antenna_gain_db": 30.0,
@@ -6,6 +7,12 @@
   "antenna_height_m": 3.0,
   "reference_range_m": 200.0,
   "meters_per_pixel": 0.375,
+  "boundary_classes": [
+    "forest",
+    "building",
+    "shrub"
+  ],
+  "boundary_thickness_px": 2,
   "receiver_sensitivity_dbw": -130.0,
   "receiver_max_level_dbw": -80.0
 }
