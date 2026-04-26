@@ -854,6 +854,7 @@ def _build_radar_glints(
     rgb_image: np.ndarray,
     candidate_mask: np.ndarray,
     primary_region: np.ndarray,
+    blind_zone_mask: np.ndarray,
     class_map: np.ndarray,
     class_names: Sequence[str],
     geometry: Mapping[str, np.ndarray],
@@ -888,6 +889,7 @@ def _build_radar_glints(
         "seed_mask": zero_float,
         "candidate_mask": candidate_mask.astype(np.float32),
         "primary_region": primary_region.astype(np.float32),
+        "blind_zone_mask": blind_zone_mask.astype(np.float32),
         "outside_attenuation": np.ones((height, width), dtype=np.float32),
         "background_noise_w": zero_float,
         "speckle_gain": np.ones((height, width), dtype=np.float32),
@@ -1095,7 +1097,10 @@ def _build_radar_glints(
     outside_attenuation = np.ones((height, width), dtype=np.float32)
     outside_attenuation[outside_mask] = np.exp(-outside_distance_px[outside_mask] / max(base_resolution_px, 1.0))
     outside_attenuation[outside_distance_px > max_spill_px] = 0.0
-    glint_power_w = (glint_signal_w * outside_attenuation + background_noise_w).astype(np.float32)
+    signal_region = primary_region.astype(bool) & ~blind_zone_mask.astype(bool)
+    signal_gate = signal_region.astype(np.float32)
+    outside_attenuation = signal_gate
+    glint_power_w = (glint_signal_w * signal_gate + background_noise_w).astype(np.float32)
 
     source_cell_ids = np.stack(
         [
@@ -1133,6 +1138,7 @@ def _build_radar_glints(
         "seed_mask": seed_mask.astype(np.float32),
         "candidate_mask": candidate_mask.astype(np.float32),
         "primary_region": primary_region.astype(np.float32),
+        "blind_zone_mask": blind_zone_mask.astype(np.float32),
         "outside_attenuation": outside_attenuation.astype(np.float32),
         "background_noise_w": background_noise_w.astype(np.float32),
         "speckle_gain": speckle_gain.astype(np.float32),
@@ -1262,6 +1268,7 @@ def map_radar_equation_to_pixels(
         meters_per_pixel=meters_per_pixel,
     )
     blind_zones_map = _render_red_mask(blind_zone_mask)
+    glint_signal_region = primary_cluster_region.astype(bool) & ~blind_zone_mask.astype(bool)
     scattering_gain_map, scattering_model_report, scattering_debug = _build_scattering_gain_map(
         rgb_image=rgb_image,
         class_map=class_map,
@@ -1299,8 +1306,9 @@ def map_radar_equation_to_pixels(
     if use_radar_glints and np.any(primary_cluster_region):
         glint_map, glint_overlay, glint_power_w, glint_report, glint_debug = _build_radar_glints(
             rgb_image=rgb_image,
-            candidate_mask=primary_cluster_region,
+            candidate_mask=glint_signal_region,
             primary_region=primary_cluster_region,
+            blind_zone_mask=blind_zone_mask,
             class_map=class_map,
             class_names=class_names,
             geometry=geometry,
@@ -1334,8 +1342,9 @@ def map_radar_equation_to_pixels(
         }
         glint_debug = {
             "seed_mask": np.zeros(class_map.shape, dtype=np.float32),
-            "candidate_mask": primary_cluster_region.astype(np.float32),
+            "candidate_mask": glint_signal_region.astype(np.float32),
             "primary_region": primary_cluster_region.astype(np.float32),
+            "blind_zone_mask": blind_zone_mask.astype(np.float32),
             "outside_attenuation": np.ones(class_map.shape, dtype=np.float32),
             "background_noise_w": np.zeros(class_map.shape, dtype=np.float32),
             "speckle_gain": np.ones(class_map.shape, dtype=np.float32),
