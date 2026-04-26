@@ -118,6 +118,7 @@ def main() -> None:
     rcs_report_path = output_dir / "rcs_report.json"
     radar_map_path = output_dir / "radar_equation_map.png"
     radar_overlay_path = output_dir / "radar_equation_overlay.png"
+    blind_zones_path = output_dir / "blind_zones.png"
     radar_glints_path = output_dir / "radar_glints.png"
     radar_glints_overlay_path = output_dir / "radar_glints_overlay.png"
     radar_boundaries_path = output_dir / "radar_boundaries.png"
@@ -142,6 +143,7 @@ def main() -> None:
     if radar_result is not None:
         save_rgb(radar_map_path, radar_result.heatmap)
         save_rgb(radar_overlay_path, radar_result.overlay)
+        save_rgb(blind_zones_path, radar_result.blind_zones_map)
         save_rgb(radar_glints_path, radar_result.glint_map)
         save_rgb(radar_glints_overlay_path, radar_result.glint_overlay)
         save_rgb(radar_boundaries_path, radar_result.boundary_map)
@@ -152,6 +154,7 @@ def main() -> None:
     else:
         _remove_if_exists(radar_map_path)
         _remove_if_exists(radar_overlay_path)
+        _remove_if_exists(blind_zones_path)
         _remove_if_exists(radar_glints_path)
         _remove_if_exists(radar_glints_overlay_path)
         _remove_if_exists(radar_boundaries_path)
@@ -182,6 +185,7 @@ def main() -> None:
         if radar_result is not None:
             save_rgb(debug_dir / "radar_equation_map.png", radar_result.heatmap)
             save_rgb(debug_dir / "radar_equation_overlay.png", radar_result.overlay)
+            save_rgb(debug_dir / "blind_zones.png", radar_result.blind_zones_map)
             save_rgb(debug_dir / "radar_glints.png", radar_result.glint_map)
             save_rgb(debug_dir / "radar_glints_overlay.png", radar_result.glint_overlay)
             save_rgb(debug_dir / "radar_boundaries.png", radar_result.boundary_map)
@@ -193,6 +197,7 @@ def main() -> None:
         else:
             _remove_if_exists(debug_dir / "radar_equation_map.png")
             _remove_if_exists(debug_dir / "radar_equation_overlay.png")
+            _remove_if_exists(debug_dir / "blind_zones.png")
             _remove_if_exists(debug_dir / "radar_glints.png")
             _remove_if_exists(debug_dir / "radar_glints_overlay.png")
             _remove_if_exists(debug_dir / "radar_boundaries.png")
@@ -218,6 +223,7 @@ def main() -> None:
         if radar_result is not None:
             report_payload["radar_equation_map_path"] = str(radar_map_path)
             report_payload["radar_equation_overlay_path"] = str(radar_overlay_path)
+            report_payload["blind_zones_path"] = str(blind_zones_path)
             report_payload["radar_glints_path"] = str(radar_glints_path)
             report_payload["radar_glints_overlay_path"] = str(radar_glints_overlay_path)
             report_payload["radar_boundaries_path"] = str(radar_boundaries_path)

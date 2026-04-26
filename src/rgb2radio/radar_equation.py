@@ -24,6 +24,7 @@ class RadarEquationResult:
     received_power_dbw: np.ndarray
     heatmap: np.ndarray
     overlay: np.ndarray
+    blind_zones_map: np.ndarray
     glint_map: np.ndarray
     glint_overlay: np.ndarray
     boundary_map: np.ndarray
@@ -213,6 +214,12 @@ def _render_grayscale(values_dbw: np.ndarray, lower_dbw: float, upper_dbw: float
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
+def _render_red_mask(mask: np.ndarray) -> np.ndarray:
+    overlay = np.zeros(mask.shape + (3,), dtype=np.uint8)
+    overlay[mask.astype(bool)] = np.array([255, 0, 0], dtype=np.uint8)
+    return overlay
+
+
 def _polar_angles_deg(dx_m: np.ndarray, dy_m: np.ndarray) -> np.ndarray:
     return ((np.degrees(np.arctan2(dy_m.astype(np.float32), dx_m.astype(np.float32))) + 360.0) % 360.0).astype(
         np.float32
@@ -299,6 +306,145 @@ def _convolve_polar_response(polar_source: np.ndarray, angle_kernel: np.ndarray,
         kernel=range_kernel[np.newaxis, :],
         borderType=cv2.BORDER_CONSTANT,
     )
+
+
+def _build_building_blind_zone_mask(
+    class_map: np.ndarray,
+    class_names: Sequence[str],
+    geometry: Mapping[str, np.ndarray],
+    scope_region: np.ndarray,
+    angular_resolution_deg: float,
+    range_resolution_m: float,
+    meters_per_pixel: float,
+) -> tuple[np.ndarray, Dict[str, object]]:
+    scope_mask = scope_region.astype(bool)
+    report: Dict[str, object] = {
+        "applied": False,
+        "occluder_classes": ["building"],
+        "scope_pixel_count": int(np.count_nonzero(scope_mask)),
+        "building_pixel_count": 0,
+        "blind_pixel_count": 0,
+        "blind_pixel_share": 0.0,
+    }
+    if "building" not in class_names or not np.any(scope_mask):
+        return np.zeros(class_map.shape, dtype=bool), report
+
+    building_mask_raw = (class_map == class_names.index("building")) & scope_mask
+    if not np.any(building_mask_raw):
+        return np.zeros(class_map.shape, dtype=bool), report
+
+    angular_sample_deg = max(float(angular_resolution_deg) / 4.0, 0.1)
+    num_angle_bins = max(32, int(np.ceil(360.0 / angular_sample_deg)))
+    full_angles_deg = _polar_angles_deg(
+        dx_m=geometry["dx_m"].astype(np.float32),
+        dy_m=geometry["dy_m"].astype(np.float32),
+    )
+    full_ranges_m = geometry["slant_range_m"].astype(np.float32)
+    full_angle_bins = np.floor(full_angles_deg / angular_sample_deg).astype(np.int32) % num_angle_bins
+    full_ranges_m = full_ranges_m.astype(np.float32)
+    origin_exclusion_px = max(10.0, 2.0 * float(range_resolution_m) / max(float(meters_per_pixel), 1e-6))
+    blind_zone_mask = np.zeros(class_map.shape, dtype=bool)
+    component_count, component_labels, component_stats, _ = cv2.connectedComponentsWithStats(
+        building_mask_raw.astype(np.uint8),
+        connectivity=8,
+    )
+    support_expand_bins = max(1, int(np.ceil(float(angular_resolution_deg) / max(angular_sample_deg, 1e-6))) // 2)
+    range_guard_m = max(float(range_resolution_m) * 0.5, float(meters_per_pixel))
+    kept_component_count = 0
+    component_reports: list[Dict[str, object]] = []
+    for label in range(1, component_count):
+        area_px = int(component_stats[label, cv2.CC_STAT_AREA])
+        if area_px <= 0:
+            continue
+        component_mask = component_labels == label
+        ys, xs = np.nonzero(component_mask)
+        component_min_distance_px = float(
+            np.min(
+                np.hypot(
+                    geometry["dx_m"][ys, xs].astype(np.float32) / max(float(meters_per_pixel), 1e-6),
+                    geometry["dy_m"][ys, xs].astype(np.float32) / max(float(meters_per_pixel), 1e-6),
+                )
+            )
+        )
+        if component_min_distance_px < origin_exclusion_px:
+            component_reports.append(
+                {
+                    "label": int(label),
+                    "area_px": area_px,
+                    "shadow_pixel_count": 0,
+                    "angular_bin_count": 0,
+                    "skipped_near_origin": True,
+                    "min_distance_px": component_min_distance_px,
+                }
+            )
+            continue
+        component_angles_deg = _polar_angles_deg(
+            dx_m=geometry["dx_m"][ys, xs].astype(np.float32),
+            dy_m=geometry["dy_m"][ys, xs].astype(np.float32),
+        )
+        component_ranges_m = geometry["slant_range_m"][ys, xs].astype(np.float32)
+        component_angle_bins = np.floor(component_angles_deg / angular_sample_deg).astype(np.int32) % num_angle_bins
+        component_support = np.zeros(num_angle_bins, dtype=bool)
+        component_back_range_m = np.full(num_angle_bins, -1.0, dtype=np.float32)
+        component_support[component_angle_bins] = True
+        np.maximum.at(component_back_range_m, component_angle_bins, component_ranges_m)
+
+        expanded_support = component_support.copy()
+        expanded_back_range_m = component_back_range_m.copy()
+        for shift in range(1, support_expand_bins + 1):
+            rolled_support_pos = np.roll(component_support, shift)
+            rolled_support_neg = np.roll(component_support, -shift)
+            expanded_support |= rolled_support_pos | rolled_support_neg
+            expanded_back_range_m = np.maximum(expanded_back_range_m, np.where(rolled_support_pos, np.roll(component_back_range_m, shift), -1.0))
+            expanded_back_range_m = np.maximum(expanded_back_range_m, np.where(rolled_support_neg, np.roll(component_back_range_m, -shift), -1.0))
+
+        component_shadow = (
+            scope_mask
+            & expanded_support[full_angle_bins]
+            & (full_ranges_m > (expanded_back_range_m[full_angle_bins] + range_guard_m))
+        )
+        component_shadow &= ~component_mask
+        if not np.any(component_shadow):
+            continue
+        blind_zone_mask |= component_shadow
+        kept_component_count += 1
+        component_reports.append(
+            {
+                "label": int(label),
+                "area_px": area_px,
+                "shadow_pixel_count": int(np.count_nonzero(component_shadow)),
+                "angular_bin_count": int(np.count_nonzero(component_support)),
+                "skipped_near_origin": False,
+                "min_distance_px": component_min_distance_px,
+            }
+        )
+
+    close_kernel_px = max(3, int(np.ceil(max(float(range_resolution_m) / max(float(meters_per_pixel), 1e-6), 1.0) / 6.0)))
+    blind_zone_mask = cv2.morphologyEx(
+        blind_zone_mask.astype(np.uint8),
+        cv2.MORPH_CLOSE,
+        _kernel(close_kernel_px),
+        iterations=1,
+    ) > 0
+    blind_zone_mask &= scope_mask
+    blind_zone_mask &= ~building_mask_raw
+
+    report = {
+        "applied": True,
+        "occluder_classes": ["building"],
+        "scope_pixel_count": int(np.count_nonzero(scope_mask)),
+        "building_pixel_count": int(np.count_nonzero(building_mask_raw)),
+        "blind_pixel_count": int(np.count_nonzero(blind_zone_mask)),
+        "blind_pixel_share": float(np.count_nonzero(blind_zone_mask) / max(blind_zone_mask.size, 1)),
+        "angular_sample_deg": float(angular_sample_deg),
+        "support_expand_bins": int(support_expand_bins),
+        "range_guard_m": float(range_guard_m),
+        "origin_exclusion_px": float(origin_exclusion_px),
+        "building_component_count": int(max(component_count - 1, 0)),
+        "shadow_component_count": int(kept_component_count),
+        "component_reports": component_reports[:12],
+    }
+    return blind_zone_mask.astype(bool), report
 
 
 def _normalize_feature_map(values: np.ndarray, mask: np.ndarray | None = None) -> np.ndarray:
@@ -1081,6 +1227,9 @@ def map_radar_equation_to_pixels(
         primary_boundary_mask=primary_boundary_mask,
         fallback_region=boundary_support_region,
     )
+    blind_zone_scope = primary_cluster_region.astype(bool)
+    if not np.any(blind_zone_scope):
+        blind_zone_scope = boundary_support_region.astype(bool)
 
     if use_radar_boundaries and np.any(boundary_support_region):
         effective_rcs_map_m2, boundary_scatter_cleanup_report = _apply_boundary_scatter_cleanup(
@@ -1103,6 +1252,16 @@ def map_radar_equation_to_pixels(
         antenna_height_m=antenna_height_m,
         range_bias_m=0.0 if origin_mode == "image_center" else reference_range_m,
     )
+    blind_zone_mask, blind_zone_report = _build_building_blind_zone_mask(
+        class_map=class_map,
+        class_names=class_names,
+        geometry=geometry,
+        scope_region=blind_zone_scope,
+        angular_resolution_deg=glint_angular_resolution_deg,
+        range_resolution_m=glint_range_resolution_m,
+        meters_per_pixel=meters_per_pixel,
+    )
+    blind_zones_map = _render_red_mask(blind_zone_mask)
     scattering_gain_map, scattering_model_report, scattering_debug = _build_scattering_gain_map(
         rgb_image=rgb_image,
         class_map=class_map,
@@ -1210,6 +1369,7 @@ def map_radar_equation_to_pixels(
         "boundary_report": boundary_report,
         "boundary_cluster_report": boundary_cluster_report,
         "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
+        "blind_zone_report": blind_zone_report,
         "scattering_model_report": scattering_model_report,
         "gaussian_noise_report": gaussian_noise_report,
         "glint_report": glint_report,
@@ -1241,6 +1401,9 @@ def map_radar_equation_to_pixels(
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
         "radar_ground_offset_m": geometry["ground_offset_m"].astype(np.float32),
         "radar_effective_rcs_map_m2": effective_rcs_map_m2.astype(np.float32),
+        "radar_blind_zone_mask": blind_zone_mask.astype(np.float32),
+        "radar_blind_zones_map_rgb": blind_zones_map,
+        "radar_blind_zone_scope": blind_zone_scope.astype(np.float32),
         "radar_scattering_gain_map": scattering_gain_map.astype(np.float32),
         "radar_scattering_roughness_map": scattering_debug["roughness_map"].astype(np.float32),
         "radar_scattering_incidence_term": scattering_debug["incidence_term"].astype(np.float32),
@@ -1274,6 +1437,7 @@ def map_radar_equation_to_pixels(
         received_power_dbw=received_power_dbw,
         heatmap=heatmap,
         overlay=overlay,
+        blind_zones_map=blind_zones_map,
         glint_map=glint_map,
         glint_overlay=glint_overlay,
         boundary_map=boundary_map,
