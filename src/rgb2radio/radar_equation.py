@@ -154,52 +154,48 @@ def _apply_boundary_scatter_cleanup(
     return effective_rcs_map_m2, cleanup_report
 
 
-def _apply_white_gaussian_noise(
-    values_dbw: np.ndarray,
-    mean_dbw: float,
-    std_dbw: float,
+def _apply_receiver_noise(
+    signal_power_w: np.ndarray,
+    noise_floor_dbw: float,
     seed: int | None,
 ) -> tuple[np.ndarray, np.ndarray, Dict[str, object]]:
-    if std_dbw <= 0.0:
-        noise = np.zeros_like(values_dbw, dtype=np.float32)
-        report: Dict[str, object] = {
-            "applied": False,
-            "mean_dbw": float(mean_dbw),
-            "std_dbw": float(std_dbw),
-            "seed": None if seed is None else int(seed),
-        }
-        return values_dbw.astype(np.float32), noise, report
-
+    receiver_floor_w = float(np.asarray(_db_to_linear(noise_floor_dbw)).reshape(-1)[0])
     rng = np.random.default_rng(seed)
-    noise = rng.normal(loc=mean_dbw, scale=std_dbw, size=values_dbw.shape).astype(np.float32)
-    noisy_values_dbw = (values_dbw.astype(np.float32) + noise).astype(np.float32)
-    report = {
+    noise_power_w = rng.exponential(scale=max(receiver_floor_w, _MIN_LINEAR_POWER), size=signal_power_w.shape).astype(
+        np.float32
+    )
+    observed_power_w = (signal_power_w.astype(np.float32) + noise_power_w).astype(np.float32)
+    report: Dict[str, object] = {
         "applied": True,
-        "mean_dbw": float(mean_dbw),
-        "std_dbw": float(std_dbw),
+        "model": "thermal_noise_exponential_power",
+        "noise_floor_dbw": float(noise_floor_dbw),
+        "noise_floor_w": receiver_floor_w,
         "seed": None if seed is None else int(seed),
-        "realized_mean_dbw": float(noise.mean()),
-        "realized_std_dbw": float(noise.std()),
+        "realized_mean_noise_w": float(noise_power_w.mean()),
+        "realized_std_noise_w": float(noise_power_w.std()),
     }
-    return noisy_values_dbw, noise, report
+    return observed_power_w, noise_power_w, report
 
 
-def _render_positive_grayscale(values_linear: np.ndarray) -> np.ndarray:
+def _render_positive_grayscale(
+    values_linear: np.ndarray,
+    floor_linear: float | None = None,
+    white_linear: float | None = None,
+) -> np.ndarray:
     positive = np.isfinite(values_linear) & (values_linear > 0.0)
     if not np.any(positive):
         return np.zeros(values_linear.shape + (3,), dtype=np.uint8)
     positive_values = values_linear[positive].astype(np.float32)
-    reference_value = float(np.percentile(positive_values, 70.0))
-    max_value = float(np.percentile(positive_values, 99.8))
-    if reference_value <= 0.0:
-        reference_value = float(np.percentile(positive_values, 25.0))
-    if max_value <= 0.0:
-        max_value = float(positive_values.max())
+    reference_value = float(floor_linear) if floor_linear is not None else float(np.percentile(positive_values, 70.0))
+    max_value = float(white_linear) if white_linear is not None else float(np.percentile(positive_values, 99.8))
+    reference_value = max(reference_value, _MIN_LINEAR_POWER)
+    max_value = max(max_value, reference_value * 1.01)
     scaled = np.zeros_like(values_linear, dtype=np.float32)
-    denominator = np.log1p(max(max_value, reference_value) / max(reference_value, 1e-12))
-    scaled[positive] = np.log1p(values_linear[positive] / max(reference_value, 1e-12)) / max(denominator, 1e-12)
+    numerator = np.log1p(np.maximum(values_linear[positive] - reference_value, 0.0) / reference_value)
+    denominator = np.log1p(max(max_value - reference_value, reference_value) / reference_value)
+    scaled[positive] = numerator / max(denominator, 1e-12)
     scaled = scaled.clip(0.0, 1.0)
-    gray = (np.power(scaled, 0.78) * 255.0).astype(np.uint8)
+    gray = (np.power(scaled, 0.72) * 255.0).astype(np.uint8)
     return np.repeat(gray[:, :, None], 3, axis=2)
 
 
@@ -306,6 +302,37 @@ def _convolve_polar_response(polar_source: np.ndarray, angle_kernel: np.ndarray,
         kernel=range_kernel[np.newaxis, :],
         borderType=cv2.BORDER_CONSTANT,
     )
+
+
+def _convolve_polar_response_complex(
+    polar_source: np.ndarray,
+    angle_kernel: np.ndarray,
+    range_kernel: np.ndarray,
+) -> np.ndarray:
+    response_real = np.zeros(polar_source.shape, dtype=np.float32)
+    response_imag = np.zeros(polar_source.shape, dtype=np.float32)
+    angle_center = len(angle_kernel) // 2
+    source_real = polar_source.real.astype(np.float32)
+    source_imag = polar_source.imag.astype(np.float32)
+    for kernel_index, kernel_weight in enumerate(angle_kernel.tolist()):
+        shift = kernel_index - angle_center
+        if abs(kernel_weight) < 1e-9:
+            continue
+        response_real += float(kernel_weight) * np.roll(source_real, shift=shift, axis=0)
+        response_imag += float(kernel_weight) * np.roll(source_imag, shift=shift, axis=0)
+    filtered_real = cv2.filter2D(
+        response_real,
+        ddepth=-1,
+        kernel=range_kernel[np.newaxis, :],
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    filtered_imag = cv2.filter2D(
+        response_imag,
+        ddepth=-1,
+        kernel=range_kernel[np.newaxis, :],
+        borderType=cv2.BORDER_CONSTANT,
+    )
+    return (filtered_real + 1j * filtered_imag).astype(np.complex64)
 
 
 def _build_building_blind_zone_mask(
@@ -483,8 +510,13 @@ def _build_scattering_gain_map(
     gray_gx = cv2.Sobel(gray_image, cv2.CV_32F, 1, 0, ksize=3)
     gray_gy = cv2.Sobel(gray_image, cv2.CV_32F, 0, 1, ksize=3)
     texture_gradient = cv2.GaussianBlur(np.sqrt(gray_gx * gray_gx + gray_gy * gray_gy), (0, 0), sigmaX=1.2, sigmaY=1.2)
+    local_mean = cv2.GaussianBlur(gray_image, (0, 0), sigmaX=3.0, sigmaY=3.0)
+    local_square_mean = cv2.GaussianBlur(gray_image * gray_image, (0, 0), sigmaX=3.0, sigmaY=3.0)
+    local_variance = np.maximum(local_square_mean - local_mean * local_mean, 0.0).astype(np.float32)
     roughness_map = _normalize_feature_map(texture_gradient)
+    volume_texture_map = _normalize_feature_map(local_variance)
     roughness_peak_map = _peak_map(roughness_map, kernel_size=3)
+    volume_peak_map = _peak_map(volume_texture_map, kernel_size=5)
 
     ground_offset_m = np.maximum(geometry["ground_offset_m"].astype(np.float32), 1e-6)
     look_unit_x = (-geometry["dx_m"].astype(np.float32) / ground_offset_m).astype(np.float32)
@@ -492,15 +524,28 @@ def _build_scattering_gain_map(
     look_unit_x[geometry["ground_offset_m"] <= 1e-6] = 0.0
     look_unit_y[geometry["ground_offset_m"] <= 1e-6] = 0.0
 
-    incidence_cos = (float(antenna_height_m) / np.maximum(geometry["slant_range_m"].astype(np.float32), float(antenna_height_m))).clip(0.0, 1.0)
+    incidence_cos = (
+        float(antenna_height_m) / np.maximum(geometry["slant_range_m"].astype(np.float32), float(antenna_height_m))
+    ).clip(0.0, 1.0)
     incidence_term = np.sqrt(incidence_cos).astype(np.float32)
+    grazing_term = np.sqrt(np.maximum(1.0 - incidence_cos, 0.0)).astype(np.float32)
+
+    class_index = {name: idx for idx, name in enumerate(class_names)}
+    road_like_mask = np.zeros(class_map.shape, dtype=bool)
+    for road_class in ("asphalt_road", "dirt_road"):
+        if road_class in class_index:
+            road_like_mask |= class_map == class_index[road_class]
+    road_neighborhood = cv2.dilate(road_like_mask.astype(np.uint8), _kernel(7), iterations=1).astype(bool)
 
     gain_map = np.ones(class_map.shape, dtype=np.float32)
+    diffuse_gain_map = np.zeros(class_map.shape, dtype=np.float32)
+    point_gain_map = np.zeros(class_map.shape, dtype=np.float32)
     edge_facing_map = np.zeros(class_map.shape, dtype=np.float32)
     corner_strength_map = np.zeros(class_map.shape, dtype=np.float32)
     edge_peak_map = np.zeros(class_map.shape, dtype=np.float32)
     roughness_peak_class_map = np.zeros(class_map.shape, dtype=np.float32)
     corner_peak_map = np.zeros(class_map.shape, dtype=np.float32)
+    dihedral_peak_map = np.zeros(class_map.shape, dtype=np.float32)
     class_reports: Dict[str, Dict[str, object]] = {}
 
     for class_index, class_name in enumerate(class_names):
@@ -509,6 +554,8 @@ def _build_scattering_gain_map(
             class_reports[class_name] = {
                 "pixel_count": 0,
                 "mean_gain": 0.0,
+                "mean_diffuse_gain": 0.0,
+                "mean_point_gain": 0.0,
                 "max_gain": 0.0,
                 "scattering_regime": "absent",
             }
@@ -528,6 +575,7 @@ def _build_scattering_gain_map(
         edge_peak_map[mask] = edge_peak[mask]
         roughness_peak_class = _peak_map(roughness_map, kernel_size=3, mask=mask)
         roughness_peak_class_map[mask] = roughness_peak_class[mask]
+        volume_peak_class = _peak_map(volume_texture_map, kernel_size=5, mask=mask)
 
         corner_strength = np.zeros(class_map.shape, dtype=np.float32)
         corner_peak = np.zeros(class_map.shape, dtype=np.float32)
@@ -539,80 +587,143 @@ def _build_scattering_gain_map(
             corner_peak_map[mask] = corner_peak[mask]
 
         roughness_term = (roughness_map * incidence_term).astype(np.float32)
+        dihedral_peak = np.zeros(class_map.shape, dtype=np.float32)
         if class_name in _SMOOTH_SURFACE_CLASSES:
-            gain_values = np.clip(
-                0.08 * incidence_term[mask]
-                + 1.10 * roughness_peak_class[mask]
-                + 0.25 * edge_peak[mask]
-                + 0.10 * roughness_term[mask],
+            smooth_surface_scale = 0.15 if class_name == "water" else 1.0
+            diffuse_values = np.clip(
+                smooth_surface_scale
+                * (
+                    0.015 * incidence_term[mask]
+                    + 0.040 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
+                    + 0.030 * volume_texture_map[mask]
+                ),
                 0.0,
-                1.1,
+                0.16,
             )
-            regime = "smooth_surface"
+            point_values = np.clip(
+                smooth_surface_scale
+                * (
+                    grazing_term[mask] * (1.35 * roughness_peak_class[mask] + 0.75 * edge_peak[mask])
+                    + 0.25 * edge_facing[mask]
+                ),
+                0.0,
+                1.60,
+            )
+            regime = "smooth_surface_microfacet"
         elif class_name in _ROUGH_SURFACE_CLASSES:
-            gain_values = np.clip(
-                0.18 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
-                + 0.70 * roughness_peak_class[mask]
-                + 0.20 * edge_peak[mask],
+            diffuse_values = np.clip(
+                0.10
+                + 0.28 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
+                + 0.18 * volume_texture_map[mask]
+                + 0.08 * edge_facing[mask],
                 0.0,
-                1.1,
+                0.95,
             )
-            regime = "rough_surface"
+            point_values = np.clip(
+                grazing_term[mask] * (0.55 * roughness_peak_class[mask] + 0.22 * edge_peak[mask])
+                + 0.15 * volume_peak_class[mask],
+                0.0,
+                0.90,
+            )
+            regime = "rough_surface_diffuse"
         elif class_name in _STRUCTURED_SURFACE_CLASSES:
-            gain_values = np.clip(
-                0.18 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
-                + 0.25 * edge_peak[mask]
-                + 0.85 * corner_peak[mask],
-                0.0,
-                1.35,
+            dihedral_support = mask & road_neighborhood
+            dihedral_raw = (
+                edge_facing
+                * dihedral_support.astype(np.float32)
+                * np.maximum(grazing_term, 0.2).astype(np.float32)
             )
-            regime = "structured_surface"
+            dihedral_peak = _peak_map(dihedral_raw, kernel_size=5, mask=dihedral_support)
+            dihedral_peak_map[mask] = dihedral_peak[mask]
+            diffuse_values = np.clip(
+                0.03
+                + 0.06 * np.sqrt(np.maximum(roughness_term[mask], 0.0))
+                + 0.08 * edge_facing[mask]
+                + 0.05 * volume_texture_map[mask],
+                0.0,
+                0.36,
+            )
+            point_values = np.clip(
+                1.25 * corner_peak[mask]
+                + 1.10 * dihedral_peak[mask]
+                + 0.35 * edge_peak[mask]
+                + 0.10 * roughness_peak_class[mask],
+                0.0,
+                2.40,
+            )
+            regime = "structured_surface_corner_dihedral"
         elif class_name in _VOLUME_SCATTER_CLASSES:
-            gain_values = np.clip(
-                0.55 * np.sqrt(np.maximum(roughness_map[mask], incidence_term[mask]))
-                + 0.20 * roughness_peak_class[mask]
-                + 0.08 * edge_peak[mask],
+            diffuse_values = np.clip(
+                0.20
+                + 0.34 * incidence_term[mask]
+                + 0.28 * np.sqrt(np.maximum(volume_texture_map[mask], 0.0))
+                + 0.14 * np.sqrt(np.maximum(roughness_term[mask], 0.0)),
                 0.0,
-                1.15,
+                1.05,
             )
-            regime = "volume_scatter"
+            point_values = np.clip(
+                0.06 * roughness_peak_class[mask] + 0.03 * volume_peak_class[mask] + 0.02 * edge_peak[mask],
+                0.0,
+                0.14,
+            )
+            regime = "volume_scatter_textured"
         elif class_name in _POINT_SCATTER_CLASSES:
-            gain_values = np.clip(1.0 + corner_peak[mask] + 0.25 * edge_peak[mask], 1.0, 1.8)
-            regime = "point_scatter"
+            diffuse_values = np.full(mask.sum(), 0.0, dtype=np.float32)
+            point_values = np.clip(1.20 + 0.90 * corner_peak[mask] + 0.30 * edge_peak[mask], 1.0, 2.40)
+            regime = "point_target"
         else:
-            gain_values = np.clip(0.35 * roughness_term[mask] + 0.45 * roughness_peak_class[mask] + 0.25 * edge_peak[mask], 0.0, 1.0)
+            diffuse_values = np.clip(
+                0.10 + 0.24 * np.sqrt(np.maximum(roughness_term[mask], 0.0)) + 0.14 * volume_texture_map[mask],
+                0.0,
+                0.75,
+            )
+            point_values = np.clip(0.35 * roughness_peak_class[mask] + 0.18 * edge_peak[mask], 0.0, 0.60)
             regime = "generic_surface"
 
+        gain_values = np.clip(diffuse_values + 0.18 * point_values, 0.0, 1.45)
         gain_map[mask] = gain_values.astype(np.float32)
+        diffuse_gain_map[mask] = diffuse_values.astype(np.float32)
+        point_gain_map[mask] = point_values.astype(np.float32)
         class_reports[class_name] = {
             "pixel_count": int(mask.sum()),
             "mean_gain": float(gain_values.mean()),
             "max_gain": float(gain_values.max()),
+            "mean_diffuse_gain": float(diffuse_values.mean()),
+            "mean_point_gain": float(point_values.mean()),
             "mean_edge_facing": float(edge_facing[mask].mean()),
             "mean_edge_peak": float(edge_peak[mask].mean()),
             "mean_roughness": float(roughness_map[mask].mean()),
             "mean_roughness_peak": float(roughness_peak_class[mask].mean()),
+            "mean_volume_texture": float(volume_texture_map[mask].mean()),
             "mean_incidence_term": float(incidence_term[mask].mean()),
             "scattering_regime": regime,
         }
 
     report: Dict[str, object] = {
-        "model": "class_regime_incidence_orientation",
+        "model": "class_regime_diffuse_point_separation",
         "class_reports": class_reports,
         "global_mean_gain": float(gain_map.mean()),
         "global_max_gain": float(gain_map.max()),
+        "global_mean_diffuse_gain": float(diffuse_gain_map.mean()),
+        "global_mean_point_gain": float(point_gain_map.mean()),
         "global_mean_incidence_term": float(incidence_term.mean()),
         "global_mean_roughness": float(roughness_map.mean()),
     }
     debug_maps = {
         "gain_map": gain_map.astype(np.float32),
+        "diffuse_gain_map": diffuse_gain_map.astype(np.float32),
+        "point_gain_map": point_gain_map.astype(np.float32),
         "roughness_map": roughness_map.astype(np.float32),
         "roughness_peak_map": roughness_peak_map.astype(np.float32),
+        "volume_texture_map": volume_texture_map.astype(np.float32),
+        "volume_peak_map": volume_peak_map.astype(np.float32),
         "incidence_term": incidence_term.astype(np.float32),
+        "grazing_term": grazing_term.astype(np.float32),
         "edge_facing_map": edge_facing_map.astype(np.float32),
         "edge_peak_map": edge_peak_map.astype(np.float32),
         "corner_strength_map": corner_strength_map.astype(np.float32),
         "corner_peak_map": corner_peak_map.astype(np.float32),
+        "dihedral_peak_map": dihedral_peak_map.astype(np.float32),
     }
     return gain_map.astype(np.float32), report, debug_maps
 
@@ -859,6 +970,7 @@ def _build_radar_glints(
     class_names: Sequence[str],
     geometry: Mapping[str, np.ndarray],
     base_received_power_w: np.ndarray,
+    scattering_debug: Mapping[str, np.ndarray],
     meters_per_pixel: float,
     angular_resolution_deg: float,
     range_resolution_m: float,
@@ -870,6 +982,7 @@ def _build_radar_glints(
     height, width = candidate_mask.shape
     zero_rgb = np.zeros((height, width, 3), dtype=np.uint8)
     zero_float = np.zeros((height, width), dtype=np.float32)
+    receiver_floor_w = float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0])
     default_report: Dict[str, object] = {
         "applied": False,
         "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
@@ -881,18 +994,20 @@ def _build_radar_glints(
         "spill_resolution_elements": float(spill_resolution_elements),
         "max_spill_px": 0.0,
         "processing_gain_db": float(peak_gain_db),
-        "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0]),
+        "background_noise_scale_w": receiver_floor_w,
         "source_cell_count": 0,
-        "response_model": "polar_cell_clutter_plus_point_targets",
+        "response_model": "resolution_cell_sinc_squared_image_space",
     }
     default_debug = {
         "seed_mask": zero_float,
         "candidate_mask": candidate_mask.astype(np.float32),
         "primary_region": primary_region.astype(np.float32),
         "blind_zone_mask": blind_zone_mask.astype(np.float32),
-        "outside_attenuation": np.ones((height, width), dtype=np.float32),
+        "outside_attenuation": np.zeros((height, width), dtype=np.float32),
         "background_noise_w": zero_float,
         "speckle_gain": np.ones((height, width), dtype=np.float32),
+        "diffuse_source_power": zero_float,
+        "point_source_power": zero_float,
         "glint_power_w": zero_float,
     }
     if (
@@ -904,18 +1019,38 @@ def _build_radar_glints(
     ):
         return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
-    candidate_source_power = np.zeros_like(base_received_power_w, dtype=np.float32)
-    candidate_source_power[candidate_mask.astype(bool)] = base_received_power_w[candidate_mask.astype(bool)].astype(np.float32)
-    seed_mask = (candidate_source_power > 0.0).astype(np.float32)
+    visible_region = primary_region.astype(bool) & ~blind_zone_mask.astype(bool)
+    effective_candidate_mask = candidate_mask.astype(bool) & visible_region
+    if not np.any(effective_candidate_mask):
+        return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
-    ys, xs = np.nonzero(candidate_mask)
+    diffuse_gain_map = np.asarray(
+        scattering_debug.get("diffuse_gain_map", np.ones_like(base_received_power_w, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    point_gain_map = np.asarray(
+        scattering_debug.get("point_gain_map", np.zeros_like(base_received_power_w, dtype=np.float32)),
+        dtype=np.float32,
+    )
+    diffuse_source_power_map = np.zeros_like(base_received_power_w, dtype=np.float32)
+    point_source_power_map = np.zeros_like(base_received_power_w, dtype=np.float32)
+    diffuse_source_power_map[effective_candidate_mask] = (
+        base_received_power_w[effective_candidate_mask].astype(np.float32)
+        * np.maximum(diffuse_gain_map[effective_candidate_mask], 0.0)
+    )
+    point_source_power_map[effective_candidate_mask] = (
+        base_received_power_w[effective_candidate_mask].astype(np.float32)
+        * np.maximum(point_gain_map[effective_candidate_mask], 0.0)
+    )
+
+    ys, xs = np.nonzero(effective_candidate_mask)
     range_m = geometry["slant_range_m"][ys, xs].astype(np.float32)
     dx_m = geometry["dx_m"][ys, xs].astype(np.float32)
     dy_m = geometry["dy_m"][ys, xs].astype(np.float32)
     theta_deg = _polar_angles_deg(dx_m=dx_m, dy_m=dy_m)
-    source_power = candidate_source_power[ys, xs].astype(np.float32)
-    source_class_indices = class_map[ys, xs].astype(np.int32)
-    if source_power.size == 0 or float(source_power.max()) <= 0.0:
+    diffuse_source_power = diffuse_source_power_map[ys, xs].astype(np.float32)
+    point_source_power = point_source_power_map[ys, xs].astype(np.float32)
+    if float(np.max(diffuse_source_power + point_source_power)) <= 0.0:
         return zero_rgb, rgb_image.copy(), zero_float, default_report, default_debug
 
     range_resolution_px = max(1.0, float(range_resolution_m / meters_per_pixel))
@@ -926,197 +1061,134 @@ def _build_radar_glints(
     median_cross_range_resolution_px = (
         float(np.median(cross_range_resolution_m / meters_per_pixel)) if cross_range_resolution_m.size else 1.0
     )
-    base_resolution_px = max(range_resolution_px, median_cross_range_resolution_px)
-    max_spill_px = max(1.0, float(spill_resolution_elements) * base_resolution_px)
-
-    range_sample_m = min(meters_per_pixel, float(range_resolution_m) / 4.0)
-    angular_sample_deg = float(angular_resolution_deg) / 4.0
-    max_range_m = float(geometry["slant_range_m"].max()) + 3.0 * float(range_resolution_m)
-    num_range_bins = max(8, int(np.ceil(max_range_m / max(range_sample_m, 1e-6))) + 2)
-    num_angle_bins = max(32, int(np.ceil(360.0 / max(angular_sample_deg, 1e-6))))
-
-    a0, a1, r0, r1, wa0, wa1, wr0, wr1 = _polar_bilinear_coordinates(
-        range_m=range_m,
-        angle_deg=theta_deg,
-        range_sample_m=range_sample_m,
-        angular_sample_deg=angular_sample_deg,
-        num_range_bins=num_range_bins,
-        num_angle_bins=num_angle_bins,
-    )
-
-    polar_source_power = _splat_to_polar(
-        values=source_power,
-        a0=a0,
-        a1=a1,
-        r0=r0,
-        r1=r1,
-        wa0=wa0,
-        wa1=wa1,
-        wr0=wr0,
-        wr1=wr1,
-        shape=(num_angle_bins, num_range_bins),
-    )
-    local_max_kernel = max(3, int(np.ceil(max(range_resolution_px, median_cross_range_resolution_px))))
-    deterministic_class_indices = np.array(
-        sorted(
-            {
-                class_names.index(class_name)
-                for class_name in class_names
-                if class_name in _STRUCTURED_SURFACE_CLASSES or class_name in _POINT_SCATTER_CLASSES
-            }
-        ),
-        dtype=np.int32,
-    )
-    deterministic_source_map = np.zeros_like(candidate_source_power, dtype=np.float32)
-    if deterministic_class_indices.size > 0:
-        deterministic_mask = np.isin(source_class_indices, deterministic_class_indices)
-        if np.any(deterministic_mask):
-            deterministic_source_map[ys[deterministic_mask], xs[deterministic_mask]] = source_power[deterministic_mask]
+    local_max_kernel = max(5, int(np.ceil(1.5 * max(range_resolution_px, median_cross_range_resolution_px))))
     deterministic_peak_map = _peak_map(
-        deterministic_source_map,
+        point_source_power_map,
         kernel_size=local_max_kernel,
-        mask=deterministic_source_map > 0.0,
+        mask=effective_candidate_mask,
     )
     seed_mask = deterministic_peak_map.astype(np.float32)
-    deterministic_peak_values = deterministic_peak_map[ys, xs].astype(np.float32)
-    deterministic_peak_mask = deterministic_peak_values > 0.0
-    if np.any(deterministic_peak_mask):
-        polar_point_source_power = _splat_to_polar(
-            values=deterministic_peak_values[deterministic_peak_mask],
-            a0=a0[deterministic_peak_mask],
-            a1=a1[deterministic_peak_mask],
-            r0=r0[deterministic_peak_mask],
-            r1=r1[deterministic_peak_mask],
-            wa0=wa0[deterministic_peak_mask],
-            wa1=wa1[deterministic_peak_mask],
-            wr0=wr0[deterministic_peak_mask],
-            wr1=wr1[deterministic_peak_mask],
-            shape=(num_angle_bins, num_range_bins),
-        )
-    else:
-        polar_point_source_power = np.zeros((num_angle_bins, num_range_bins), dtype=np.float32)
 
-    range_offsets_m = np.arange(
-        -3.0 * float(range_resolution_m),
-        3.0 * float(range_resolution_m) + range_sample_m * 0.5,
-        range_sample_m,
-        dtype=np.float32,
-    )
-    angle_offsets_deg = np.arange(
-        -3.0 * float(angular_resolution_deg),
-        3.0 * float(angular_resolution_deg) + angular_sample_deg * 0.5,
-        angular_sample_deg,
-        dtype=np.float32,
-    )
-    range_kernel = np.sinc(range_offsets_m / max(float(range_resolution_m), 1e-6)).astype(np.float32) ** 2
-    angle_kernel = np.sinc(angle_offsets_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.float32) ** 2
-    range_kernel /= max(float(range_kernel.sum()), 1e-12)
-    angle_kernel /= max(float(angle_kernel.sum()), 1e-12)
+    angle_cell = np.floor(theta_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.int32)
+    range_cell = np.floor(range_m / max(float(range_resolution_m), 1e-6)).astype(np.int32)
+    cell_ids = np.stack([angle_cell, range_cell], axis=1)
+    unique_cells, inverse = np.unique(cell_ids, axis=0, return_inverse=True)
+    source_cell_count = int(unique_cells.shape[0])
+
+    weights = diffuse_source_power + point_source_power + _MIN_LINEAR_POWER
+    cell_weight_sum = np.bincount(inverse, weights=weights, minlength=source_cell_count).astype(np.float32)
+    cell_diffuse_total = np.bincount(inverse, weights=diffuse_source_power, minlength=source_cell_count).astype(np.float32)
+    cell_x = np.bincount(inverse, weights=xs.astype(np.float32) * weights, minlength=source_cell_count).astype(np.float32)
+    cell_y = np.bincount(inverse, weights=ys.astype(np.float32) * weights, minlength=source_cell_count).astype(np.float32)
+    cell_range_m = np.bincount(inverse, weights=range_m * weights, minlength=source_cell_count).astype(np.float32)
+    cell_dx_m = np.bincount(inverse, weights=dx_m * weights, minlength=source_cell_count).astype(np.float32)
+    cell_dy_m = np.bincount(inverse, weights=dy_m * weights, minlength=source_cell_count).astype(np.float32)
+
+    peak_ys, peak_xs = np.nonzero(deterministic_peak_map > 0.0)
+    cell_point_total = np.zeros(source_cell_count, dtype=np.float32)
+    if peak_ys.size > 0:
+        peak_range_m = geometry["slant_range_m"][peak_ys, peak_xs].astype(np.float32)
+        peak_theta_deg = _polar_angles_deg(
+            dx_m=geometry["dx_m"][peak_ys, peak_xs].astype(np.float32),
+            dy_m=geometry["dy_m"][peak_ys, peak_xs].astype(np.float32),
+        )
+        peak_angle_cell = np.floor(peak_theta_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.int32)
+        peak_range_cell = np.floor(peak_range_m / max(float(range_resolution_m), 1e-6)).astype(np.int32)
+        peak_cell_lookup = {
+            (int(angle_value), int(range_value)): cell_index
+            for cell_index, (angle_value, range_value) in enumerate(unique_cells.tolist())
+        }
+        peak_values = deterministic_peak_map[peak_ys, peak_xs].astype(np.float32)
+        for peak_value, angle_value, range_value in zip(
+            peak_values.tolist(),
+            peak_angle_cell.tolist(),
+            peak_range_cell.tolist(),
+        ):
+            cell_index = peak_cell_lookup.get((int(angle_value), int(range_value)))
+            if cell_index is not None:
+                cell_point_total[cell_index] += float(peak_value)
 
     processing_gain_linear = float(np.asarray(_db_to_linear(peak_gain_db)).reshape(-1)[0])
-    polar_clutter_mean_power = (
-        _convolve_polar_response(
-            polar_source=polar_source_power,
-            angle_kernel=angle_kernel,
-            range_kernel=range_kernel,
-        )
-        * processing_gain_linear
-    ).astype(np.float32)
-    polar_point_response_power = (
-        _convolve_polar_response(
-            polar_source=polar_point_source_power,
-            angle_kernel=angle_kernel,
-            range_kernel=range_kernel,
-        )
-        * processing_gain_linear
-    ).astype(np.float32)
     glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
-    polar_clutter_power = (
-        polar_clutter_mean_power
-        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_clutter_mean_power.shape).astype(np.float32)
+    signal_power_w = np.zeros((height, width), dtype=np.float32)
+    speckle_gain = np.ones((height, width), dtype=np.float32)
+
+    for cell_index in range(source_cell_count):
+        weight_sum = float(cell_weight_sum[cell_index])
+        if weight_sum <= 0.0:
+            continue
+        diffuse_total = float(cell_diffuse_total[cell_index]) * processing_gain_linear
+        point_total = float(cell_point_total[cell_index]) * processing_gain_linear
+        if diffuse_total <= 0.0 and point_total <= 0.0:
+            continue
+
+        clutter_sample = float(glint_noise_rng.exponential(scale=max(diffuse_total, _MIN_LINEAR_POWER))) if diffuse_total > 0.0 else 0.0
+        point_sample = point_total
+        total_cell_power = clutter_sample + point_sample
+        if total_cell_power <= 0.0:
+            continue
+
+        cx = float(cell_x[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
+        cy = float(cell_y[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
+        mean_range = float(cell_range_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
+        mean_dx = float(cell_dx_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
+        mean_dy = float(cell_dy_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
+        norm = float(np.hypot(mean_dx, mean_dy))
+        if norm <= 1e-6:
+            radial_x_px, radial_y_px = 1.0, 0.0
+        else:
+            radial_x_px = mean_dx / max(norm, 1e-6)
+            radial_y_px = mean_dy / max(norm, 1e-6)
+        cross_x_px = -radial_y_px
+        cross_y_px = radial_x_px
+
+        cross_resolution_m = max(mean_range * np.deg2rad(float(angular_resolution_deg)), meters_per_pixel)
+        range_support_px = max(2, int(np.ceil(2.0 * range_resolution_m / meters_per_pixel)))
+        cross_support_px = max(2, int(np.ceil(2.0 * cross_resolution_m / meters_per_pixel)))
+        x0 = max(0, int(np.floor(cx - max(range_support_px, cross_support_px))))
+        x1 = min(width, int(np.ceil(cx + max(range_support_px, cross_support_px) + 1)))
+        y0 = max(0, int(np.floor(cy - max(range_support_px, cross_support_px))))
+        y1 = min(height, int(np.ceil(cy + max(range_support_px, cross_support_px) + 1)))
+        if x0 >= x1 or y0 >= y1:
+            continue
+
+        patch_y, patch_x = np.mgrid[y0:y1, x0:x1].astype(np.float32)
+        offset_x_m = (patch_x - cx) * float(meters_per_pixel)
+        offset_y_m = (patch_y - cy) * float(meters_per_pixel)
+        range_offset_m = offset_x_m * radial_x_px + offset_y_m * radial_y_px
+        cross_offset_m = offset_x_m * cross_x_px + offset_y_m * cross_y_px
+        psf = (
+            np.square(np.sinc(range_offset_m / max(float(range_resolution_m), 1e-6))).astype(np.float32)
+            * np.square(np.sinc(cross_offset_m / max(cross_resolution_m, 1e-6))).astype(np.float32)
+        )
+        psf_sum = float(psf.sum())
+        if psf_sum <= 1e-12:
+            continue
+        psf = (psf / psf_sum).astype(np.float32)
+        signal_power_w[y0:y1, x0:x1] += total_cell_power * psf
+        local_speckle = np.ones_like(psf, dtype=np.float32) * max(clutter_sample / max(diffuse_total, _MIN_LINEAR_POWER), 1.0)
+        speckle_gain[y0:y1, x0:x1] = np.maximum(speckle_gain[y0:y1, x0:x1], local_speckle)
+
+    signal_gate = visible_region.astype(np.float32)
+    signal_power_w *= signal_gate
+    background_noise_w = glint_noise_rng.exponential(
+        scale=max(receiver_floor_w, _MIN_LINEAR_POWER),
+        size=signal_power_w.shape,
     ).astype(np.float32)
+    glint_power_w = (signal_power_w + background_noise_w).astype(np.float32)
+    outside_attenuation = signal_gate.astype(np.float32)
 
-    receiver_floor_w = float(np.asarray(_db_to_linear(receiver_floor_dbw)).reshape(-1)[0])
-    polar_floor = (
-        receiver_floor_w
-        * glint_noise_rng.gamma(shape=1.0, scale=1.0, size=polar_clutter_mean_power.shape).astype(np.float32)
+    positive_glint = glint_power_w[np.isfinite(glint_power_w) & (glint_power_w > 0.0)]
+    white_linear = float(np.percentile(positive_glint, 99.85)) if positive_glint.size > 0 else receiver_floor_w
+    glint_map = _render_positive_grayscale(
+        glint_power_w,
+        floor_linear=receiver_floor_w,
+        white_linear=max(white_linear, receiver_floor_w * 4.0),
     )
-
-    full_range_m = geometry["slant_range_m"].astype(np.float32)
-    full_angle_deg = _polar_angles_deg(
-        dx_m=geometry["dx_m"].astype(np.float32),
-        dy_m=geometry["dy_m"].astype(np.float32),
-    )
-    full_a0, full_a1, full_r0, full_r1, full_wa0, full_wa1, full_wr0, full_wr1 = _polar_bilinear_coordinates(
-        range_m=full_range_m,
-        angle_deg=full_angle_deg,
-        range_sample_m=range_sample_m,
-        angular_sample_deg=angular_sample_deg,
-        num_range_bins=num_range_bins,
-        num_angle_bins=num_angle_bins,
-    )
-
-    polar_response_power = (polar_clutter_power + polar_point_response_power).astype(np.float32)
-
-    glint_signal_w = _sample_from_polar(
-        polar_grid=polar_response_power,
-        a0=full_a0,
-        a1=full_a1,
-        r0=full_r0,
-        r1=full_r1,
-        wa0=full_wa0,
-        wa1=full_wa1,
-        wr0=full_wr0,
-        wr1=full_wr1,
-    )
-    background_noise_w = _sample_from_polar(
-        polar_grid=polar_floor,
-        a0=full_a0,
-        a1=full_a1,
-        r0=full_r0,
-        r1=full_r1,
-        wa0=full_wa0,
-        wa1=full_wa1,
-        wr0=full_wr0,
-        wr1=full_wr1,
-    )
-    speckle_gain = _sample_from_polar(
-        polar_grid=(polar_clutter_power / np.maximum(polar_clutter_mean_power, _MIN_LINEAR_POWER)).astype(np.float32),
-        a0=full_a0,
-        a1=full_a1,
-        r0=full_r0,
-        r1=full_r1,
-        wa0=full_wa0,
-        wa1=full_wa1,
-        wr0=full_wr0,
-        wr1=full_wr1,
-    )
-
-    outside_mask = ~primary_region.astype(bool)
-    outside_distance_px = cv2.distanceTransform(outside_mask.astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
-    outside_attenuation = np.ones((height, width), dtype=np.float32)
-    outside_attenuation[outside_mask] = np.exp(-outside_distance_px[outside_mask] / max(base_resolution_px, 1.0))
-    outside_attenuation[outside_distance_px > max_spill_px] = 0.0
-    signal_region = primary_region.astype(bool) & ~blind_zone_mask.astype(bool)
-    signal_gate = signal_region.astype(np.float32)
-    outside_attenuation = signal_gate
-    glint_power_w = (glint_signal_w * signal_gate + background_noise_w).astype(np.float32)
-
-    source_cell_ids = np.stack(
-        [
-            np.floor(theta_deg / max(float(angular_resolution_deg), 1e-6)).astype(np.int32),
-            np.floor(range_m / max(float(range_resolution_m), 1e-6)).astype(np.int32),
-        ],
-        axis=1,
-    )
-    source_cell_count = int(np.unique(source_cell_ids, axis=0).shape[0]) if source_cell_ids.size else 0
-    background_noise_scale_w = receiver_floor_w
-
-    glint_map = _render_positive_grayscale(glint_power_w)
     glint_overlay = np.clip(rgb_image.astype(np.float32) + glint_map.astype(np.float32) * 0.85, 0, 255).astype(np.uint8)
     report: Dict[str, object] = {
         "applied": True,
-        "candidate_glint_pixels": int(np.count_nonzero(candidate_mask)),
+        "candidate_glint_pixels": int(np.count_nonzero(effective_candidate_mask)),
         "selected_glint_count": source_cell_count,
         "dominant_scatterer_count": int(np.count_nonzero(seed_mask)),
         "angular_resolution_deg": float(angular_resolution_deg),
@@ -1124,26 +1196,24 @@ def _build_radar_glints(
         "range_resolution_px": float(range_resolution_px),
         "median_cross_range_resolution_px": float(median_cross_range_resolution_px),
         "spill_resolution_elements": float(spill_resolution_elements),
-        "max_spill_px": float(max_spill_px),
+        "max_spill_px": 0.0,
         "processing_gain_db": float(peak_gain_db),
-        "background_noise_scale_w": float(background_noise_scale_w),
-        "polar_range_sample_m": float(range_sample_m),
-        "polar_angular_sample_deg": float(angular_sample_deg),
+        "background_noise_scale_w": float(receiver_floor_w),
         "source_cell_count": source_cell_count,
         "local_peak_kernel_px": int(local_max_kernel),
         "deterministic_peak_count": int(np.count_nonzero(deterministic_peak_map)),
-        "response_model": "polar_cell_clutter_plus_point_targets",
+        "response_model": "resolution_cell_sinc_squared_image_space",
     }
     debug_maps = {
         "seed_mask": seed_mask.astype(np.float32),
-        "candidate_mask": candidate_mask.astype(np.float32),
+        "candidate_mask": effective_candidate_mask.astype(np.float32),
         "primary_region": primary_region.astype(np.float32),
         "blind_zone_mask": blind_zone_mask.astype(np.float32),
         "outside_attenuation": outside_attenuation.astype(np.float32),
         "background_noise_w": background_noise_w.astype(np.float32),
         "speckle_gain": speckle_gain.astype(np.float32),
-        "polar_source_power": polar_source_power.astype(np.float32),
-        "polar_response_power": polar_response_power.astype(np.float32),
+        "diffuse_source_power": diffuse_source_power_map.astype(np.float32),
+        "point_source_power": point_source_power_map.astype(np.float32),
         "glint_power_w": glint_power_w.astype(np.float32),
     }
     return glint_map, glint_overlay, glint_power_w.astype(np.float32), report, debug_maps
@@ -1288,21 +1358,22 @@ def map_radar_equation_to_pixels(
         * (wavelength_m ** 2)
         / (((4.0 * np.pi) ** 3) * max(system_loss_linear, 1e-12))
     )
-    received_power_w = (
+    received_signal_w = (
         radar_constant
         * np.maximum(effective_rcs_map_m2, 0.0)
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
         * np.maximum(scattering_gain_map, 0.0)
     ).astype(np.float32)
-    raw_received_power_w = received_power_w.copy()
+    received_signal_w[blind_zone_mask.astype(bool)] = 0.0
+    raw_received_power_w = received_signal_w.copy()
     raw_received_power_dbw = _linear_to_db(raw_received_power_w)
-    received_power_dbw, noise_dbw, gaussian_noise_report = _apply_white_gaussian_noise(
-        values_dbw=raw_received_power_dbw,
-        mean_dbw=gaussian_noise_mean_dbw,
-        std_dbw=gaussian_noise_std_dbw,
+    receiver_noise_floor_dbw = receiver_sensitivity_dbw + gaussian_noise_mean_dbw
+    received_power_w, receiver_noise_w, receiver_noise_report = _apply_receiver_noise(
+        signal_power_w=raw_received_power_w,
+        noise_floor_dbw=receiver_noise_floor_dbw,
         seed=gaussian_noise_seed,
     )
-    received_power_w = _db_to_linear(received_power_dbw)
+    received_power_dbw = _linear_to_db(received_power_w)
     if use_radar_glints and np.any(primary_cluster_region):
         glint_map, glint_overlay, glint_power_w, glint_report, glint_debug = _build_radar_glints(
             rgb_image=rgb_image,
@@ -1313,6 +1384,7 @@ def map_radar_equation_to_pixels(
             class_names=class_names,
             geometry=geometry,
             base_received_power_w=raw_received_power_w,
+            scattering_debug=scattering_debug,
             meters_per_pixel=meters_per_pixel,
             angular_resolution_deg=glint_angular_resolution_deg,
             range_resolution_m=glint_range_resolution_m,
@@ -1338,16 +1410,18 @@ def map_radar_equation_to_pixels(
             "processing_gain_db": float(glint_peak_gain_db),
             "background_noise_scale_w": float(np.asarray(_db_to_linear(receiver_sensitivity_dbw)).reshape(-1)[0]),
             "source_cell_count": 0,
-            "response_model": "polar_cell_clutter_plus_point_targets",
+            "response_model": "polar_beam_clutter_plus_sparse_point_targets",
         }
         glint_debug = {
             "seed_mask": np.zeros(class_map.shape, dtype=np.float32),
             "candidate_mask": glint_signal_region.astype(np.float32),
             "primary_region": primary_cluster_region.astype(np.float32),
             "blind_zone_mask": blind_zone_mask.astype(np.float32),
-            "outside_attenuation": np.ones(class_map.shape, dtype=np.float32),
+            "outside_attenuation": np.zeros(class_map.shape, dtype=np.float32),
             "background_noise_w": np.zeros(class_map.shape, dtype=np.float32),
             "speckle_gain": np.ones(class_map.shape, dtype=np.float32),
+            "diffuse_source_power": np.zeros(class_map.shape, dtype=np.float32),
+            "point_source_power": np.zeros(class_map.shape, dtype=np.float32),
             "glint_power_w": glint_power_w.astype(np.float32),
         }
     heatmap = _render_grayscale(
@@ -1380,7 +1454,7 @@ def map_radar_equation_to_pixels(
         "boundary_scatter_cleanup_report": boundary_scatter_cleanup_report,
         "blind_zone_report": blind_zone_report,
         "scattering_model_report": scattering_model_report,
-        "gaussian_noise_report": gaussian_noise_report,
+        "receiver_noise_report": receiver_noise_report,
         "glint_report": glint_report,
         "config": {
             "origin_mode": origin_mode,
@@ -1414,12 +1488,17 @@ def map_radar_equation_to_pixels(
         "radar_blind_zones_map_rgb": blind_zones_map,
         "radar_blind_zone_scope": blind_zone_scope.astype(np.float32),
         "radar_scattering_gain_map": scattering_gain_map.astype(np.float32),
+        "radar_scattering_diffuse_gain_map": scattering_debug["diffuse_gain_map"].astype(np.float32),
+        "radar_scattering_point_gain_map": scattering_debug["point_gain_map"].astype(np.float32),
         "radar_scattering_roughness_map": scattering_debug["roughness_map"].astype(np.float32),
+        "radar_scattering_volume_texture_map": scattering_debug["volume_texture_map"].astype(np.float32),
         "radar_scattering_incidence_term": scattering_debug["incidence_term"].astype(np.float32),
+        "radar_scattering_grazing_term": scattering_debug["grazing_term"].astype(np.float32),
         "radar_scattering_edge_facing_map": scattering_debug["edge_facing_map"].astype(np.float32),
         "radar_scattering_corner_strength_map": scattering_debug["corner_strength_map"].astype(np.float32),
+        "radar_scattering_dihedral_peak_map": scattering_debug["dihedral_peak_map"].astype(np.float32),
         "radar_received_power_dbw_raw": raw_received_power_dbw.astype(np.float32),
-        "radar_white_gaussian_noise_dbw": noise_dbw.astype(np.float32),
+        "radar_receiver_noise_w": receiver_noise_w.astype(np.float32),
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
@@ -1438,6 +1517,8 @@ def map_radar_equation_to_pixels(
     debug_maps["radar_glint_outside_attenuation"] = glint_debug["outside_attenuation"].astype(np.float32)
     debug_maps["radar_glint_background_noise_w"] = glint_debug["background_noise_w"].astype(np.float32)
     debug_maps["radar_glint_speckle_gain"] = glint_debug["speckle_gain"].astype(np.float32)
+    debug_maps["radar_glint_diffuse_source_power"] = glint_debug["diffuse_source_power"].astype(np.float32)
+    debug_maps["radar_glint_point_source_power"] = glint_debug["point_source_power"].astype(np.float32)
     for class_name, boundary_values in per_class_boundaries.items():
         debug_maps[f"radar_boundary_{class_name}"] = boundary_values.astype(np.float32)
 
