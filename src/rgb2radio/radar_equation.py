@@ -8,6 +8,24 @@ from typing import Dict, Mapping, Sequence
 import cv2
 import numpy as np
 
+def _sinc_squared_kernel(sample_step: float, resolution: float, spill_resolution_elements: float):
+    import numpy as np
+    safe_resolution = max(float(resolution), 1e-6)
+    safe_sample_step = max(float(sample_step), 1e-6)
+
+    half_width = max(1, int(np.ceil(float(spill_resolution_elements) * safe_resolution / safe_sample_step)))
+    offsets = np.arange(-half_width, half_width + 1, dtype=np.float32) * safe_sample_step
+
+    kernel = np.square(np.sinc(offsets / safe_resolution)).astype(np.float32)
+    kernel_sum = float(kernel.sum())
+
+    if kernel_sum <= 1e-12:
+        kernel[half_width] = 1.0
+        return kernel
+
+    return (kernel / kernel_sum).astype(np.float32)
+
+
 
 SPEED_OF_LIGHT_M_S = 299_792_458.0
 _MIN_LINEAR_POWER = 1e-18
@@ -934,16 +952,32 @@ def _build_radar_boundaries(
         per_class_maps[class_name] = full_boundary.astype(np.float32)
         report[class_name] = {"pixel_count": int(full_boundary.sum())}
 
-    filtered_boundaries, support_region, primary_boundary_mask, cluster_report = _keep_central_boundary_cluster(
-        boundary_mask=all_boundaries,
-        origin_px=origin_px,
-        center_radius_px=center_radius_px,
-    )
-    all_boundaries = filtered_boundaries
-    for class_name, class_boundary in per_class_maps.items():
-        filtered_class_boundary = class_boundary.astype(bool) & all_boundaries
-        per_class_maps[class_name] = filtered_class_boundary.astype(np.float32)
-        report[class_name] = {"pixel_count": int(filtered_class_boundary.sum())}
+    primary_boundary_mask = all_boundaries.astype(bool)
+    if np.any(primary_boundary_mask):
+        closed_boundaries = cv2.morphologyEx(
+            primary_boundary_mask.astype(np.uint8),
+            cv2.MORPH_CLOSE,
+            _kernel(9),
+            iterations=2,
+        )
+        contours, _ = cv2.findContours(closed_boundaries, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        support_region_uint8 = np.zeros((height, width), dtype=np.uint8)
+        if contours:
+            cv2.drawContours(support_region_uint8, contours, -1, 1, thickness=cv2.FILLED)
+            support_region_uint8 = cv2.dilate(support_region_uint8, _kernel(9), iterations=1)
+        else:
+            support_region_uint8 = cv2.dilate(primary_boundary_mask.astype(np.uint8), _kernel(9), iterations=1)
+        support_region = support_region_uint8 > 0
+    else:
+        support_region = np.zeros((height, width), dtype=bool)
+
+    cluster_report = {
+        "component_count": 0,
+        "center_radius_px": float(center_radius_px),
+        "selection_mode": "disabled",
+        "selected_component": None,
+        "kept_pixel_count": int(np.count_nonzero(all_boundaries)),
+    }
 
     boundary_map = np.zeros((height, width, 3), dtype=np.uint8)
     boundary_map[all_boundaries] = 255
@@ -1110,64 +1144,91 @@ def _build_radar_glints(
 
     processing_gain_linear = float(np.asarray(_db_to_linear(peak_gain_db)).reshape(-1)[0])
     glint_noise_rng = np.random.default_rng(None if noise_seed is None else int(noise_seed) + 101)
-    signal_power_w = np.zeros((height, width), dtype=np.float32)
+
+    source_power_map = np.zeros((height, width), dtype=np.float32)
     speckle_gain = np.ones((height, width), dtype=np.float32)
 
-    for cell_index in range(source_cell_count):
-        weight_sum = float(cell_weight_sum[cell_index])
-        if weight_sum <= 0.0:
-            continue
-        diffuse_total = float(cell_diffuse_total[cell_index]) * processing_gain_linear
-        point_total = float(cell_point_total[cell_index]) * processing_gain_linear
-        if diffuse_total <= 0.0 and point_total <= 0.0:
-            continue
-
-        clutter_sample = float(glint_noise_rng.exponential(scale=max(diffuse_total, _MIN_LINEAR_POWER))) if diffuse_total > 0.0 else 0.0
-        point_sample = point_total
-        total_cell_power = clutter_sample + point_sample
-        if total_cell_power <= 0.0:
-            continue
-
-        cx = float(cell_x[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
-        cy = float(cell_y[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
-        mean_range = float(cell_range_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
-        mean_dx = float(cell_dx_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
-        mean_dy = float(cell_dy_m[cell_index] / max(weight_sum, _MIN_LINEAR_POWER))
-        norm = float(np.hypot(mean_dx, mean_dy))
-        if norm <= 1e-6:
-            radial_x_px, radial_y_px = 1.0, 0.0
-        else:
-            radial_x_px = mean_dx / max(norm, 1e-6)
-            radial_y_px = mean_dy / max(norm, 1e-6)
-        cross_x_px = -radial_y_px
-        cross_y_px = radial_x_px
-
-        cross_resolution_m = max(mean_range * np.deg2rad(float(angular_resolution_deg)), meters_per_pixel)
-        range_support_px = max(2, int(np.ceil(2.0 * range_resolution_m / meters_per_pixel)))
-        cross_support_px = max(2, int(np.ceil(2.0 * cross_resolution_m / meters_per_pixel)))
-        x0 = max(0, int(np.floor(cx - max(range_support_px, cross_support_px))))
-        x1 = min(width, int(np.ceil(cx + max(range_support_px, cross_support_px) + 1)))
-        y0 = max(0, int(np.floor(cy - max(range_support_px, cross_support_px))))
-        y1 = min(height, int(np.ceil(cy + max(range_support_px, cross_support_px) + 1)))
-        if x0 >= x1 or y0 >= y1:
-            continue
-
-        patch_y, patch_x = np.mgrid[y0:y1, x0:x1].astype(np.float32)
-        offset_x_m = (patch_x - cx) * float(meters_per_pixel)
-        offset_y_m = (patch_y - cy) * float(meters_per_pixel)
-        range_offset_m = offset_x_m * radial_x_px + offset_y_m * radial_y_px
-        cross_offset_m = offset_x_m * cross_x_px + offset_y_m * cross_y_px
-        psf = (
-            np.square(np.sinc(range_offset_m / max(float(range_resolution_m), 1e-6))).astype(np.float32)
-            * np.square(np.sinc(cross_offset_m / max(cross_resolution_m, 1e-6))).astype(np.float32)
+    diffuse_positive = diffuse_source_power_map > 0.0
+    if np.any(diffuse_positive):
+        diffuse_scale = np.maximum(diffuse_source_power_map * processing_gain_linear, _MIN_LINEAR_POWER)
+        diffuse_sample = glint_noise_rng.exponential(scale=diffuse_scale).astype(np.float32)
+        source_power_map[diffuse_positive] += diffuse_sample[diffuse_positive]
+        local_speckle = diffuse_sample / np.maximum(diffuse_scale, _MIN_LINEAR_POWER)
+        speckle_gain[diffuse_positive] = np.maximum(
+            speckle_gain[diffuse_positive],
+            local_speckle[diffuse_positive],
         )
-        psf_sum = float(psf.sum())
-        if psf_sum <= 1e-12:
-            continue
-        psf = (psf / psf_sum).astype(np.float32)
-        signal_power_w[y0:y1, x0:x1] += total_cell_power * psf
-        local_speckle = np.ones_like(psf, dtype=np.float32) * max(clutter_sample / max(diffuse_total, _MIN_LINEAR_POWER), 1.0)
-        speckle_gain[y0:y1, x0:x1] = np.maximum(speckle_gain[y0:y1, x0:x1], local_speckle)
+
+    point_peak_map = deterministic_peak_map.astype(np.float32) * processing_gain_linear
+    source_power_map += point_peak_map
+    source_power_map *= effective_candidate_mask.astype(np.float32)
+
+    range_sample_m = max(float(range_resolution_m) / 4.0, float(meters_per_pixel))
+    angular_sample_deg = max(float(angular_resolution_deg) / 4.0, 0.05)
+
+    max_range_m = float(np.max(geometry["slant_range_m"]))
+    num_range_bins = max(8, int(np.ceil(max_range_m / range_sample_m)) + 4)
+    num_angle_bins = max(64, int(np.ceil(360.0 / angular_sample_deg)))
+
+    all_angles_deg = _polar_angles_deg(
+        dx_m=geometry["dx_m"].astype(np.float32),
+        dy_m=geometry["dy_m"].astype(np.float32),
+    )
+    all_ranges_m = geometry["slant_range_m"].astype(np.float32)
+
+    a0, a1, r0, r1, wa0, wa1, wr0, wr1 = _polar_bilinear_coordinates(
+        range_m=all_ranges_m,
+        angle_deg=all_angles_deg,
+        range_sample_m=range_sample_m,
+        angular_sample_deg=angular_sample_deg,
+        num_range_bins=num_range_bins,
+        num_angle_bins=num_angle_bins,
+    )
+
+    polar_source = _splat_to_polar(
+        values=source_power_map,
+        a0=a0,
+        a1=a1,
+        r0=r0,
+        r1=r1,
+        wa0=wa0,
+        wa1=wa1,
+        wr0=wr0,
+        wr1=wr1,
+        shape=(num_angle_bins, num_range_bins),
+    )
+
+    range_kernel = _sinc_squared_kernel(
+        sample_step=range_sample_m,
+        resolution=float(range_resolution_m),
+        spill_resolution_elements=float(spill_resolution_elements),
+    )
+
+    angle_kernel = _sinc_squared_kernel(
+        sample_step=angular_sample_deg,
+        resolution=float(angular_resolution_deg),
+        spill_resolution_elements=float(spill_resolution_elements),
+    )
+
+    polar_response = _convolve_polar_response(
+        polar_source=polar_source,
+        angle_kernel=angle_kernel,
+        range_kernel=range_kernel,
+    )
+
+    signal_power_w = _sample_from_polar(
+        polar_grid=polar_response,
+        a0=a0,
+        a1=a1,
+        r0=r0,
+        r1=r1,
+        wa0=wa0,
+        wa1=wa1,
+        wr0=wr0,
+        wr1=wr1,
+    )
+
+    signal_power_w = signal_power_w.reshape(height, width).astype(np.float32)
 
     signal_gate = visible_region.astype(np.float32)
     signal_power_w *= signal_gate
@@ -1227,45 +1288,83 @@ def map_radar_equation_to_pixels(
     config_path: str | Path,
     pipeline_switches: Mapping[str, bool] | None = None,
 ) -> RadarEquationResult:
+    # ---------------------------------------------------------
+    # 1. Загрузка конфига радара
+    # ---------------------------------------------------------
     config = _load_radar_config(config_path)
     switches = dict(pipeline_switches or {})
+
+    # Основные параметры уравнения радиолокации
     frequency_ghz = _require_float(config, "frequency_ghz")
     transmit_power_w = _require_float(config, "transmit_power_w")
     antenna_gain_db = _require_float(config, "antenna_gain_db")
     system_loss_db = _require_float(config, "system_loss_db")
+
+    # Геометрия сцены
     antenna_height_m = _require_float(config, "antenna_height_m")
     reference_range_m = _require_float(config, "reference_range_m")
     meters_per_pixel = _require_float(config, "meters_per_pixel")
+
+    # Ограничения приёмника / визуализации
     receiver_sensitivity_dbw = _require_float(config, "receiver_sensitivity_dbw")
     receiver_max_level_dbw = _require_float(config, "receiver_max_level_dbw")
+
+    # Шум приёмника
     gaussian_noise_mean_dbw = float(config.get("gaussian_noise_mean_dbw", 0.0))
     gaussian_noise_std_dbw = float(config.get("gaussian_noise_std_dbw", 0.75))
     raw_noise_seed = config.get("gaussian_noise_seed", 42)
     gaussian_noise_seed = None if raw_noise_seed is None else int(raw_noise_seed)
+
+    # Параметры бликов / сильных точечных отражателей
     glint_angular_resolution_deg = float(config.get("glint_angular_resolution_deg", 1.0))
     glint_range_resolution_m = float(config.get("glint_range_resolution_m", 1.5))
     glint_spill_resolution_elements = float(config.get("glint_spill_resolution_elements", 2.5))
     glint_peak_gain_db = float(config.get("glint_peak_gain_db", 9.0))
+
     if receiver_max_level_dbw <= receiver_sensitivity_dbw:
         raise ValueError("receiver_max_level_dbw must be greater than receiver_sensitivity_dbw.")
+
+    # ---------------------------------------------------------
+    # 2. Флаги пайплайна
+    # ---------------------------------------------------------
     use_radar_boundaries = bool(switches.get("use_radar_boundaries", True))
     use_radar_glints = bool(switches.get("use_radar_glints", True))
+
+    # Классы, по границам которых строим radar boundary mask
     raw_boundary_classes = config.get("boundary_classes", ["forest", "building", "shrub"])
     if isinstance(raw_boundary_classes, Sequence) and not isinstance(raw_boundary_classes, str):
         boundary_classes = [str(value) for value in raw_boundary_classes]
     else:
         boundary_classes = ["forest", "building", "shrub"]
+
     boundary_thickness_px = int(config.get("boundary_thickness_px", 2))
-    boundary_cluster_center_radius_px = float(config.get("boundary_cluster_center_radius_px", 0.35 * min(rgb_image.shape[:2])))
+    boundary_cluster_center_radius_px = float(
+        config.get("boundary_cluster_center_radius_px", 0.35 * min(rgb_image.shape[:2]))
+    )
+
+    # origin_mode определяет, откуда считается дальность:
+    # image_center — радар как бы в центре изображения
+    # другой режим — добавляется reference_range_m
     origin_mode = str(config.get("origin_mode", "image_center")).lower()
 
+    # ---------------------------------------------------------
+    # 3. Определение положения радара на изображении
+    # ---------------------------------------------------------
     origin_px = _resolve_radar_origin(
         config=config,
         shape=rgb_image.shape[:2],
         probabilities=probabilities,
         class_names=class_names,
     )
+
+    # class_map — финальная карта классов из probability tensor
     class_map = np.argmax(probabilities, axis=0).astype(np.uint8)
+
+    # ---------------------------------------------------------
+    # 4. Построение границ объектов
+    # ---------------------------------------------------------
+    # Границы нужны как proxy для сильных отражений:
+    # края зданий, лесные границы, резкие переходы классов.
     if use_radar_boundaries:
         (
             boundary_map,
@@ -1287,7 +1386,10 @@ def map_radar_equation_to_pixels(
     else:
         boundary_map = np.zeros_like(rgb_image)
         boundary_overlay = rgb_image.copy()
-        per_class_boundaries = {class_name: np.zeros(class_map.shape, dtype=np.float32) for class_name in boundary_classes}
+        per_class_boundaries = {
+            class_name: np.zeros(class_map.shape, dtype=np.float32)
+            for class_name in boundary_classes
+        }
         boundary_report = {class_name: {"pixel_count": 0} for class_name in boundary_classes}
         boundary_cluster_report = {
             "component_count": 0,
@@ -1299,14 +1401,26 @@ def map_radar_equation_to_pixels(
         boundary_support_region = np.zeros(class_map.shape, dtype=bool)
         primary_boundary_mask = np.zeros(class_map.shape, dtype=bool)
 
-    primary_cluster_region = _estimate_primary_cluster_region(
-        primary_boundary_mask=primary_boundary_mask,
-        fallback_region=boundary_support_region,
-    )
+    # ---------------------------------------------------------
+    # 5. Основной кластер отражения
+    # ---------------------------------------------------------
+    # Из primary boundary mask строится область основного объекта/кластера.
+    primary_cluster_region = boundary_support_region.astype(bool)
+    if not np.any(primary_cluster_region):
+        positive_rcs_region = (np.isfinite(pixel_rcs_map_m2.astype(np.float32)) & (pixel_rcs_map_m2.astype(np.float32) > 0.0))
+        primary_cluster_region = positive_rcs_region.astype(bool)
+    if not np.any(primary_cluster_region):
+        primary_cluster_region = np.ones(class_map.shape, dtype=bool)
+
+    # Область, в которой считаем blind zones.
     blind_zone_scope = primary_cluster_region.astype(bool)
     if not np.any(blind_zone_scope):
         blind_zone_scope = boundary_support_region.astype(bool)
 
+    # ---------------------------------------------------------
+    # 6. Очистка RCS вне важных boundary-областей
+    # ---------------------------------------------------------
+    # Убирает лишнюю рассеянную энергию там, где boundary model считает её мусором.
     if use_radar_boundaries and np.any(boundary_support_region):
         effective_rcs_map_m2, boundary_scatter_cleanup_report = _apply_boundary_scatter_cleanup(
             pixel_rcs_map_m2=pixel_rcs_map_m2,
@@ -1321,6 +1435,13 @@ def map_radar_equation_to_pixels(
             "preserved_pixel_count": int(np.count_nonzero(boundary_support_region)),
         }
 
+    # ---------------------------------------------------------
+    # 7. Геометрия дальности
+    # ---------------------------------------------------------
+    # Для каждого пикселя считаются:
+    # - ground offset
+    # - slant range
+    # - углы относительно радара
     geometry = _geometry(
         shape=rgb_image.shape[:2],
         origin_px=origin_px,
@@ -1328,6 +1449,11 @@ def map_radar_equation_to_pixels(
         antenna_height_m=antenna_height_m,
         range_bias_m=0.0 if origin_mode == "image_center" else reference_range_m,
     )
+
+    # ---------------------------------------------------------
+    # 8. Blind zones / радиотени
+    # ---------------------------------------------------------
+    # Строит зоны за объектами, где отражённый сигнал должен быть подавлен.
     blind_zone_mask, blind_zone_report = _build_building_blind_zone_mask(
         class_map=class_map,
         class_names=class_names,
@@ -1337,8 +1463,17 @@ def map_radar_equation_to_pixels(
         range_resolution_m=glint_range_resolution_m,
         meters_per_pixel=meters_per_pixel,
     )
+
     blind_zones_map = _render_red_mask(blind_zone_mask)
+
+    # Блики разрешены только в основном кластере и не в blind zone
     glint_signal_region = primary_cluster_region.astype(bool) & ~blind_zone_mask.astype(bool)
+
+    # ---------------------------------------------------------
+    # 9. Модель scattering gain
+    # ---------------------------------------------------------
+    # Дополнительный коэффициент усиления/ослабления отражения:
+    # roughness, edge-facing, corners, incidence angle, grazing angle.
     scattering_gain_map, scattering_model_report, scattering_debug = _build_scattering_gain_map(
         rgb_image=rgb_image,
         class_map=class_map,
@@ -1347,10 +1482,20 @@ def map_radar_equation_to_pixels(
         antenna_height_m=antenna_height_m,
     )
 
+    # ---------------------------------------------------------
+    # 10. Radar equation constants
+    # ---------------------------------------------------------
     wavelength_m = SPEED_OF_LIGHT_M_S / (frequency_ghz * 1e9)
+
     antenna_gain_linear = float(_db_to_linear(antenna_gain_db))
     system_loss_linear = float(_db_to_linear(system_loss_db))
 
+    # Константная часть уравнения радара:
+    #
+    # Pr = Pt * Gt * Gr * lambda^2 * sigma
+    #      / ((4*pi)^3 * R^4 * L)
+    #
+    # Здесь Gt = Gr = antenna_gain_linear.
     radar_constant = (
         transmit_power_w
         * antenna_gain_linear
@@ -1358,23 +1503,40 @@ def map_radar_equation_to_pixels(
         * (wavelength_m ** 2)
         / (((4.0 * np.pi) ** 3) * max(system_loss_linear, 1e-12))
     )
+
+    # ---------------------------------------------------------
+    # 11. Расчёт принятой мощности по каждому пикселю
+    # ---------------------------------------------------------
     received_signal_w = (
         radar_constant
         * np.maximum(effective_rcs_map_m2, 0.0)
         / np.maximum(geometry["slant_range_m"], 1.0) ** 4
-        * np.maximum(scattering_gain_map, 0.0)
+        # * np.maximum(scattering_gain_map, 0.0)
     ).astype(np.float32)
+
+    # В blind zone сигнал принудительно обнуляется
     received_signal_w[blind_zone_mask.astype(bool)] = 0.0
+
     raw_received_power_w = received_signal_w.copy()
     raw_received_power_dbw = _linear_to_db(raw_received_power_w)
+
+    # ---------------------------------------------------------
+    # 12. Шум приёмника
+    # ---------------------------------------------------------
     receiver_noise_floor_dbw = receiver_sensitivity_dbw + gaussian_noise_mean_dbw
+
     received_power_w, receiver_noise_w, receiver_noise_report = _apply_receiver_noise(
         signal_power_w=raw_received_power_w,
         noise_floor_dbw=receiver_noise_floor_dbw,
         seed=gaussian_noise_seed,
     )
+
     received_power_dbw = _linear_to_db(received_power_w)
-    if use_radar_glints and np.any(primary_cluster_region):
+
+    # ---------------------------------------------------------
+    # 13. Radar glints / точечные сильные отражения
+    # ---------------------------------------------------------
+    if use_radar_glints:
         glint_map, glint_overlay, glint_power_w, glint_report, glint_debug = _build_radar_glints(
             rgb_image=rgb_image,
             candidate_mask=glint_signal_region,
@@ -1424,15 +1586,24 @@ def map_radar_equation_to_pixels(
             "point_source_power": np.zeros(class_map.shape, dtype=np.float32),
             "glint_power_w": glint_power_w.astype(np.float32),
         }
+
+    # ---------------------------------------------------------
+    # 14. Визуализация принятой мощности
+    # ---------------------------------------------------------
     heatmap = _render_grayscale(
         values_dbw=received_power_dbw,
         lower_dbw=receiver_sensitivity_dbw,
         upper_dbw=receiver_max_level_dbw,
     )
+
     overlay = (
-        rgb_image.astype(np.float32) * 0.56 + heatmap.astype(np.float32) * 0.44
+        rgb_image.astype(np.float32) * 0.56
+        + heatmap.astype(np.float32) * 0.44
     ).clip(0, 255).astype(np.uint8)
 
+    # ---------------------------------------------------------
+    # 15. Summary / отчёт
+    # ---------------------------------------------------------
     summary = {
         "min_received_power_dbw": float(received_power_dbw.min()),
         "max_received_power_dbw": float(received_power_dbw.max()),
@@ -1446,6 +1617,7 @@ def map_radar_equation_to_pixels(
         "visual_black_level_dbw": float(receiver_sensitivity_dbw),
         "visual_white_level_dbw": float(receiver_max_level_dbw),
     }
+
     report: Dict[str, object] = {
         "equation": "Pr = Pt * Gt * Gr * lambda^2 * sigma / ((4*pi)^3 * R^4 * L)",
         "summary": summary,
@@ -1480,6 +1652,10 @@ def map_radar_equation_to_pixels(
         },
         "pipeline_switches": dict(switches),
     }
+
+    # ---------------------------------------------------------
+    # 16. Debug maps
+    # ---------------------------------------------------------
     debug_maps: Dict[str, np.ndarray] = {
         "radar_slant_range_m": geometry["slant_range_m"].astype(np.float32),
         "radar_ground_offset_m": geometry["ground_offset_m"].astype(np.float32),
@@ -1487,6 +1663,7 @@ def map_radar_equation_to_pixels(
         "radar_blind_zone_mask": blind_zone_mask.astype(np.float32),
         "radar_blind_zones_map_rgb": blind_zones_map,
         "radar_blind_zone_scope": blind_zone_scope.astype(np.float32),
+
         "radar_scattering_gain_map": scattering_gain_map.astype(np.float32),
         "radar_scattering_diffuse_gain_map": scattering_debug["diffuse_gain_map"].astype(np.float32),
         "radar_scattering_point_gain_map": scattering_debug["point_gain_map"].astype(np.float32),
@@ -1497,14 +1674,17 @@ def map_radar_equation_to_pixels(
         "radar_scattering_edge_facing_map": scattering_debug["edge_facing_map"].astype(np.float32),
         "radar_scattering_corner_strength_map": scattering_debug["corner_strength_map"].astype(np.float32),
         "radar_scattering_dihedral_peak_map": scattering_debug["dihedral_peak_map"].astype(np.float32),
+
         "radar_received_power_dbw_raw": raw_received_power_dbw.astype(np.float32),
         "radar_receiver_noise_w": receiver_noise_w.astype(np.float32),
         "radar_received_power_dbw": received_power_dbw.astype(np.float32),
         "radar_equation_map_rgb": heatmap,
         "radar_equation_overlay_rgb": overlay,
+
         "radar_glints_map_rgb": glint_map,
         "radar_glints_overlay_rgb": glint_overlay,
         "radar_glints_power_w": glint_power_w.astype(np.float32),
+
         "radar_boundary_map_rgb": boundary_map,
         "radar_boundary_overlay_rgb": boundary_overlay,
         "radar_boundary_cluster_mask": (boundary_map[:, :, 0] > 0).astype(np.float32),
@@ -1512,6 +1692,8 @@ def map_radar_equation_to_pixels(
         "radar_primary_boundary_mask": primary_boundary_mask.astype(np.float32),
         "radar_primary_cluster_region": primary_cluster_region.astype(np.float32),
     }
+
+    # Debug карты по glints
     debug_maps["radar_glint_seed_mask"] = glint_debug["seed_mask"].astype(np.float32)
     debug_maps["radar_glint_candidate_mask"] = glint_debug["candidate_mask"].astype(np.float32)
     debug_maps["radar_glint_outside_attenuation"] = glint_debug["outside_attenuation"].astype(np.float32)
@@ -1519,9 +1701,14 @@ def map_radar_equation_to_pixels(
     debug_maps["radar_glint_speckle_gain"] = glint_debug["speckle_gain"].astype(np.float32)
     debug_maps["radar_glint_diffuse_source_power"] = glint_debug["diffuse_source_power"].astype(np.float32)
     debug_maps["radar_glint_point_source_power"] = glint_debug["point_source_power"].astype(np.float32)
+
+    # Debug карты границ по каждому boundary-классу
     for class_name, boundary_values in per_class_boundaries.items():
         debug_maps[f"radar_boundary_{class_name}"] = boundary_values.astype(np.float32)
 
+    # ---------------------------------------------------------
+    # 17. Финальный результат
+    # ---------------------------------------------------------
     return RadarEquationResult(
         received_power_w=received_power_w,
         received_power_dbw=received_power_dbw,

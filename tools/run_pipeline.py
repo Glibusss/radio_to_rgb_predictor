@@ -71,7 +71,7 @@ def main() -> None:
     pipeline_switches = load_pipeline_switches(args.pipeline_config)
     input_path = args.input or resolve_existing_path(
         [
-            PROJECT_ROOT / "real_data.png",
+            PROJECT_ROOT / "real_data2.png",
         ]
     )
 

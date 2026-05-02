@@ -34,7 +34,7 @@ def main() -> None:
     args = build_parser().parse_args()
     optical_path = args.optical or resolve_existing_path(
         [
-            PROJECT_ROOT / "real_data.png",
+            PROJECT_ROOT / "real_data2.png",
         ]
     )
 

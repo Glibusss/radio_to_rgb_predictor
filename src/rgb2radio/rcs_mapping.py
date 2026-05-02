@@ -99,8 +99,7 @@ def _resolve_reference_range_db(config: Mapping[str, object], class_name: str) -
 
 
 def _class_constant_db(min_db: float, max_db: float) -> float:
-    return 0.5 * (float(min_db) + float(max_db))
-
+    return float(min_db) #0.5 * (float(min_db) + float(max_db))
 
 def _vehicle_component_map(
     mask: np.ndarray,
@@ -265,17 +264,44 @@ def map_rcs_to_pixels(
     config_path: str | Path,
     pipeline_switches: Mapping[str, bool] | None = None,
 ) -> RcsMappingResult:
+    # ---------------------------------------------------------
+    # 1. Загрузка конфигурации RCS
+    # ---------------------------------------------------------
+    # config — JSON, где для каждого класса указаны
+    # минимум и максимум RCS в dBsm
     config = _load_rcs_config(config_path)
+
+    # проверяем что все классы из segmentation присутствуют в конфиге
     _validate_rcs_config(config, class_names)
+
+    # pipeline switches — флаги поведения пайплайна
     switches = dict(pipeline_switches or {})
+
     pixel_area_m2 = PIXEL_AREA_M2
     low_percentile = _LOW_PERCENTILE
     high_percentile = _HIGH_PERCENTILE
-    use_brightness_normalization = bool(switches.get("use_brightness_normalization", True))
-    use_shadow_rcs_nearest_majority = bool(switches.get("use_shadow_rcs_nearest_majority", True))
-    use_vehicle_rcs_distribution = bool(switches.get("use_vehicle_rcs_distribution", True))
 
+    # использовать ли нормализацию по яркости
+    use_brightness_normalization = bool(
+        switches.get("use_brightness_normalization", True)
+    )
+
+    # заполнять ли тени через nearest majority
+    use_shadow_rcs_nearest_majority = bool(
+        switches.get("use_shadow_rcs_nearest_majority", True)
+    )
+
+    # распределять ли RCS по пикселям транспорта
+    use_vehicle_rcs_distribution = bool(
+        switches.get("use_vehicle_rcs_distribution", True)
+    )
+
+    # ---------------------------------------------------------
+    # 2. Извлечение яркости (V канал HSV)
+    # ---------------------------------------------------------
     brightness = _value_brightness(rgb_image)
+
+    # нормализация яркости отдельно для каждого класса
     normalized_brightness, brightness_stats = _classwise_normalize(
         brightness=brightness,
         class_map=class_map,
@@ -283,16 +309,32 @@ def map_rcs_to_pixels(
         low_percentile=low_percentile,
         high_percentile=high_percentile,
     )
-    if not use_brightness_normalization:
-        normalized_brightness = np.full_like(normalized_brightness, 0.5, dtype=np.float32)
 
+    # если нормализация отключена — ставим фиксированное значение
+    if not use_brightness_normalization:
+        normalized_brightness = np.full_like(normalized_brightness, 0.5)
+
+    # ---------------------------------------------------------
+    # 3. Основные карты RCS
+    # ---------------------------------------------------------
+    # линейная RCS карта (м²)
     linear_map_m2 = np.zeros_like(brightness, dtype=np.float32)
+
+    # карта sigma0 (ЭПР)
     sigma0_db_map = np.full_like(brightness, np.nan, dtype=np.float32)
+
     class_reports: Dict[str, Dict[str, object]] = {}
+
+    # поправка на площадь пикселя
     surface_area_offset_db = float(10.0 * np.log10(pixel_area_m2))
 
+    # ---------------------------------------------------------
+    # 4. Обработка каждого класса сегментации
+    # ---------------------------------------------------------
     for class_index, class_name in enumerate(class_names):
+
         mask = class_map == class_index
+
         if not np.any(mask):
             class_reports[class_name] = {
                 "pixel_count": 0,
@@ -300,15 +342,25 @@ def map_rcs_to_pixels(
             }
             continue
 
+        # тени обрабатываются отдельно
         if class_name in _SHADOW_CLASS_NAMES:
             continue
 
+        # читаем диапазон RCS из конфигурации
         min_db, max_db = _resolve_reference_range_db(config, class_name)
-        brightness_values = normalized_brightness[mask].astype(np.float32)
+
+        brightness_values = normalized_brightness[mask]
+
+        # середина диапазона
         constant_db = _class_constant_db(min_db, max_db)
 
+        # -----------------------------------------------------
+        # 4.1 Специальная обработка транспорта
+        # -----------------------------------------------------
         if class_name == "vehicle":
+
             if use_vehicle_rcs_distribution:
+
                 component_map, component_reports = _vehicle_component_map(
                     mask=mask,
                     normalized_brightness=normalized_brightness,
@@ -317,8 +369,10 @@ def map_rcs_to_pixels(
                     distribution_bias=_VEHICLE_DISTRIBUTION_BIAS,
                     use_distribution=use_vehicle_rcs_distribution,
                 )
+
                 linear_map_m2[mask] = component_map[mask]
                 sigma0_db_map[mask] = np.nan
+
                 class_reports[class_name] = {
                     "pixel_count": int(mask.sum()),
                     "pixel_share": float(mask.mean()),
@@ -330,29 +384,32 @@ def map_rcs_to_pixels(
                     "mean_pixel_rcs_dbsm": float(_linear_to_db(component_map[mask]).mean()),
                     "component_reports": component_reports,
                 }
+
             else:
+
                 constant_linear = float(_db_to_linear(constant_db))
+
                 linear_map_m2[mask] = constant_linear
                 sigma0_db_map[mask] = np.nan
-                class_reports[class_name] = {
-                    "pixel_count": int(mask.sum()),
-                    "pixel_share": float(mask.mean()),
-                    "reference_range_db": [min_db, max_db],
-                    "class_constant_db": constant_db,
-                    "brightness_stats": brightness_stats.get(class_name, {}),
-                    "sum_rcs_m2": float(linear_map_m2[mask].sum()),
-                    "mean_pixel_rcs_m2": float(linear_map_m2[mask].mean()),
-                    "mean_pixel_rcs_dbsm": float(_linear_to_db(linear_map_m2[mask]).mean()),
-                }
+
             continue
 
+        # -----------------------------------------------------
+        # 4.2 Обычные классы поверхности
+        # -----------------------------------------------------
+
         if use_brightness_normalization:
-            sigma0_db = (min_db + brightness_values * (max_db - min_db)).astype(np.float32)
+            sigma0_db = min_db + brightness_values * (max_db - min_db)
         else:
-            sigma0_db = np.full(mask.sum(), constant_db, dtype=np.float32)
+            sigma0_db = np.full(mask.sum(), constant_db)
+
         sigma0_db_map[mask] = sigma0_db
+
+        # перевод sigma0 -> pixel RCS
         per_pixel_dbsm = sigma0_db + surface_area_offset_db
+
         linear_map_m2[mask] = _db_to_linear(per_pixel_dbsm)
+
         class_reports[class_name] = {
             "pixel_count": int(mask.sum()),
             "pixel_share": float(mask.mean()),
@@ -368,63 +425,61 @@ def map_rcs_to_pixels(
             "mean_pixel_rcs_dbsm": float(_linear_to_db(linear_map_m2[mask]).mean()),
         }
 
-    shadow_indices = _shadow_indices(class_names)
-    non_shadow_mask = ~np.isin(class_map, shadow_indices)
-    if np.any(non_shadow_mask):
-        shadow_mask = ~non_shadow_mask
-        if use_shadow_rcs_nearest_majority:
-            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _nearest_majority_shadow_fill(
-                shadow_mask=shadow_mask,
-                class_map=class_map,
-                direct_linear_map=linear_map_m2,
-                class_names=class_names,
-            )
-        else:
-            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _global_shadow_fill(
-                shadow_mask=shadow_mask,
-                class_map=class_map,
-                direct_linear_map=linear_map_m2,
-                class_names=class_names,
-            )
-        linear_map_m2[shadow_mask] = filled_shadow_linear[shadow_mask]
-        sigma0_db_map[shadow_mask] = _linear_to_db(linear_map_m2[shadow_mask]) - surface_area_offset_db
+    # ---------------------------------------------------------
+    # 5. Обработка теней
+    # ---------------------------------------------------------
 
-        for shadow_class_name in _SHADOW_CLASS_NAMES:
-            shadow_index = class_names.index(shadow_class_name)
-            shadow_class_mask = class_map == shadow_index
-            donor_histogram: Dict[str, int] = {}
-            if np.any(shadow_class_mask):
-                donor_values, donor_counts = np.unique(shadow_donor_classes[shadow_class_mask], return_counts=True)
-                for donor_index, donor_count in zip(donor_values.tolist(), donor_counts.tolist()):
-                    if donor_index < 0:
-                        continue
-                    donor_histogram[class_names[int(donor_index)]] = int(donor_count)
-                class_reports[shadow_class_name] = {
-                    "pixel_count": int(shadow_class_mask.sum()),
-                    "pixel_share": float(shadow_class_mask.mean()),
-                    "brightness_stats": brightness_stats.get(shadow_class_name, {}),
-                    "sum_rcs_m2": float(linear_map_m2[shadow_class_mask].sum()),
-                    "mean_pixel_rcs_m2": float(linear_map_m2[shadow_class_mask].mean()),
-                    "mean_pixel_rcs_dbsm": float(_linear_to_db(linear_map_m2[shadow_class_mask]).mean()),
-                    "donor_class_histogram": donor_histogram,
-                    "mean_search_radius_px": float(shadow_radius_map[shadow_class_mask].mean()),
-                }
-            else:
-                class_reports[shadow_class_name] = {
-                    "pixel_count": 0,
-                    "pixel_share": 0.0,
-                }
-    else:
-        shadow_donor_classes = np.full(class_map.shape, -1, dtype=np.int16)
-        shadow_radius_map = np.zeros(class_map.shape, dtype=np.float32)
+    shadow_indices = _shadow_indices(class_names)
+
+    non_shadow_mask = ~np.isin(class_map, shadow_indices)
+
+    if np.any(non_shadow_mask):
+
+        shadow_mask = ~non_shadow_mask
+
+        if use_shadow_rcs_nearest_majority:
+
+            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _nearest_majority_shadow_fill(
+                shadow_mask,
+                class_map,
+                linear_map_m2,
+                class_names,
+            )
+
+        else:
+
+            filled_shadow_linear, shadow_donor_classes, shadow_radius_map = _global_shadow_fill(
+                shadow_mask,
+                class_map,
+                linear_map_m2,
+                class_names,
+            )
+
+        linear_map_m2[shadow_mask] = filled_shadow_linear[shadow_mask]
+
+        sigma0_db_map[shadow_mask] = (
+            _linear_to_db(linear_map_m2[shadow_mask]) - surface_area_offset_db
+        )
+
+    # ---------------------------------------------------------
+    # 6. Финальные карты
+    # ---------------------------------------------------------
 
     dbsm_map = _linear_to_db(linear_map_m2)
+
     heatmap = _render_heatmap(dbsm_map)
+
     overlay = (
-        rgb_image.astype(np.float32) * 0.56 + heatmap.astype(np.float32) * 0.44
+        rgb_image.astype(np.float32) * 0.56
+        + heatmap.astype(np.float32) * 0.44
     ).clip(0, 255).astype(np.uint8)
 
+    # ---------------------------------------------------------
+    # 7. Общая статистика
+    # ---------------------------------------------------------
+
     valid_samples = dbsm_map[np.isfinite(dbsm_map)]
+
     summary = {
         "min_pixel_rcs_dbsm": float(valid_samples.min()) if valid_samples.size else None,
         "max_pixel_rcs_dbsm": float(valid_samples.max()) if valid_samples.size else None,
@@ -433,46 +488,36 @@ def map_rcs_to_pixels(
         "pixel_area_m2": pixel_area_m2,
         "config_path": str(config["config_path"]),
     }
-    report: Dict[str, object] = {
-        "summary": summary,
-        "brightness_normalization": {
-            "metric": "hsv_value",
-            "low_percentile": low_percentile,
-            "high_percentile": high_percentile,
-            "enabled": use_brightness_normalization,
-        },
-        "class_reports": class_reports,
-        "pipeline_switches": dict(switches),
-        "notes": [
-            "When brightness normalization is disabled, each configured class uses one constant EPR value equal to the midpoint of its minimum and maximum range.",
-            "Shadow pixels inherit EPR from the nearest ring of non-shadow classes using the most frequent class on that ring.",
-            "Vehicle can either use one constant class value or be distributed across connected components depending on the pipeline switches."
-        ],
-    }
 
-    debug_maps: Dict[str, np.ndarray] = {
-        "brightness_value": brightness.astype(np.float32),
-        "brightness_normalized_by_class": normalized_brightness.astype(np.float32),
-        "rcs_dbsm_map": dbsm_map.astype(np.float32),
+    # ---------------------------------------------------------
+    # 8. Debug карты
+    # ---------------------------------------------------------
+
+    debug_maps = {
+        "brightness_value": brightness,
+        "brightness_normalized_by_class": normalized_brightness,
+        "rcs_dbsm_map": dbsm_map,
         "rcs_heatmap_rgb": heatmap,
         "rcs_overlay_rgb": overlay,
         "shadow_donor_class_map": shadow_donor_classes.astype(np.float32),
         "shadow_search_radius_px": shadow_radius_map.astype(np.float32),
     }
-    finite_sigma = np.isfinite(sigma0_db_map)
-    if np.any(finite_sigma):
-        sigma_debug = sigma0_db_map.copy()
-        sigma_debug[~finite_sigma] = np.nanmin(sigma0_db_map[finite_sigma])
-        debug_maps["sigma0_db_map"] = sigma_debug.astype(np.float32)
+
+    # ---------------------------------------------------------
+    # 9. Результат
+    # ---------------------------------------------------------
 
     return RcsMappingResult(
-        linear_map_m2=linear_map_m2.astype(np.float32),
-        dbsm_map=dbsm_map.astype(np.float32),
+        linear_map_m2=linear_map_m2,
+        dbsm_map=dbsm_map,
         heatmap=heatmap,
         overlay=overlay,
-        brightness=brightness.astype(np.float32),
-        normalized_brightness=normalized_brightness.astype(np.float32),
+        brightness=brightness,
+        normalized_brightness=normalized_brightness,
         debug_maps=debug_maps,
-        report=report,
+        report={
+            "summary": summary,
+            "class_reports": class_reports,
+        },
         config=config,
     )
